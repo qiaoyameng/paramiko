@@ -4,6 +4,7 @@ Tests focusing primarily on the authentication step.
 Thus, they concern AuthHandler and AuthStrategy, with a side of Transport.
 """
 
+import threading
 from logging import Logger
 from unittest.mock import Mock
 
@@ -11,6 +12,8 @@ from pytest import raises
 
 from paramiko import (
     AgentKey,
+    AUTH_FAILED,
+    AUTH_SUCCESSFUL,
     AuthenticationException,
     AuthFailure,
     AuthResult,
@@ -18,6 +21,7 @@ from paramiko import (
     AuthStrategy,
     BadAuthenticationType,
     Ed25519Key,
+    InteractiveChallenge,
     InMemoryPrivateKey,
     NoneAuth,
     OnDiskPrivateKey,
@@ -25,15 +29,38 @@ from paramiko import (
     PKey,
     PrivateKey,
     RSAKey,
+    ServerInterface,
     SourceResult,
     SSHException,
+    Transport,
 )
+from paramiko.common import MSG_GLOBAL_REQUEST
 
 from ._util import (
     _support,
     server,
     unicodey,
+    wait_until,
 )
+
+
+class _RecordingTransport(Transport):
+    """
+    Server-side Transport recording pre-auth global requests, proving its
+    network thread keeps processing protocol messages while an asynchronous
+    challenge awaits out-of-band answers.
+    """
+
+    __test__ = False
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.pre_auth_global_requests = 0
+
+    def _ensure_authed(self, ptype, message):
+        if ptype == MSG_GLOBAL_REQUEST and not self.is_authenticated():
+            self.pre_auth_global_requests += 1
+        return super()._ensure_authed(ptype, message)
 
 
 class AuthHandler_:
@@ -147,6 +174,286 @@ class AuthHandler_:
             tc.auth_timeout = 1  # 1 second, to speed up test
             tc.auth_password("unresponsive-server", "hello")
             assert "Authentication timeout" in str(info.value)
+
+
+class ChallengeServer(ServerInterface):
+    """
+    Server speaking the asynchronous interactive-challenge API.
+
+    ``rounds`` is a list of ``(prompts, expected_responses)`` pairs; each
+    round is issued as its own `.InteractiveChallenge` with a unique id.
+    """
+
+    __test__ = False
+
+    def __init__(self, rounds, timeout=None):
+        self.rounds = rounds
+        self.timeout = timeout
+        self.round_index = 0
+        self.challenges = []
+
+    def get_allowed_auths(self, username):
+        return "keyboard-interactive"
+
+    def check_global_request(self, kind, msg):
+        return kind == "ping"
+
+    def _make_challenge(self):
+        prompts, _ = self.rounds[self.round_index]
+        challenge = InteractiveChallenge(
+            "round-{}".format(self.round_index),
+            "Answer round {}".format(self.round_index),
+            *prompts,
+            timeout=self.timeout,
+        )
+        self.challenges.append(challenge)
+        return challenge
+
+    def check_auth_interactive_challenge(self, username, submethods):
+        return self._make_challenge()
+
+    def check_auth_interactive_challenge_response(self, challenge, responses):
+        _, expected = self.rounds[self.round_index]
+        if list(responses) != list(expected):
+            return AUTH_FAILED
+        self.round_index += 1
+        if self.round_index < len(self.rounds):
+            return self._make_challenge()
+        return AUTH_SUCCESSFUL
+
+
+def _auth_interactive_in_thread(tc, username, handler):
+    outcome = {}
+
+    def run():
+        try:
+            outcome["result"] = tc.auth_interactive(username, handler)
+        except Exception as e:
+            outcome["error"] = e
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    return thread, outcome
+
+
+def _challenge_pending(ts):
+    assert ts.get_interactive_challenge() is not None
+
+
+def _challenge_cleared(ts):
+    assert ts.get_interactive_challenge() is None
+
+
+def _assert_transport_responsive(tc, ts, expected_requests, timeout=5):
+    # send a global request from the client; the server's network thread
+    # must process it (and its rejection must come back) even while the
+    # server is still waiting for out-of-band challenge answers
+    outcome = {}
+
+    def call():
+        tc.global_request("ping", wait=True)
+        outcome["done"] = True
+
+    thread = threading.Thread(target=call, daemon=True)
+    thread.start()
+    thread.join(timeout)
+    assert outcome.get("done"), "server transport thread appears blocked"
+    assert ts.pre_auth_global_requests == expected_requests
+
+
+def _ignoring_handler(prompts_seen):
+    # client-side handler: records prompts; its in-protocol answers are
+    # ignored by the server in async challenge mode
+    def handler(title, instructions, prompts):
+        prompts_seen.append((title, prompts))
+        return ["ignored"] * len(prompts)
+
+    return handler
+
+
+class AsyncInteractiveChallenge_:
+    """
+    Server-side asynchronous (out-of-band) keyboard-interactive challenges.
+    """
+
+    def two_rounds_answered_out_of_band(self):
+        """
+        Two rounds of different prompts are answered via
+        submit_interactive_responses while the transport stays responsive.
+        """
+        prompts_seen = []
+        serv = ChallengeServer(
+            [
+                ([("PIN:", False)], ["1234"]),
+                ([("OTP:", False)], ["567890"]),
+            ]
+        )
+        with server(
+            defer=True,
+            server_obj=serv,
+            server_transport_factory=_RecordingTransport,
+        ) as (tc, ts):
+            thread, outcome = _auth_interactive_in_thread(
+                tc, "commie", _ignoring_handler(prompts_seen)
+            )
+            try:
+                # round 1: a uniquely identified challenge is pending
+                wait_until(lambda: _challenge_pending(ts))
+                ch1 = ts.get_interactive_challenge()
+                assert ch1.prompts == [("PIN:", False)]
+                # the transport still processes protocol messages while
+                # waiting for the out-of-band answers
+                _assert_transport_responsive(tc, ts, 1)
+                # answering round 1 out-of-band starts round 2
+                ch2 = ts.submit_interactive_responses(
+                    ch1.challenge_id, ["1234"]
+                )
+                assert isinstance(ch2, InteractiveChallenge)
+                assert ch2.challenge_id != ch1.challenge_id
+                assert ch2.prompts == [("OTP:", False)]
+                assert ch1.done.is_set()
+                assert ch1.resolution == "answered"
+                # still responsive while waiting for round 2 answers
+                _assert_transport_responsive(tc, ts, 2)
+                # answering round 2 completes authentication
+                result = ts.submit_interactive_responses(
+                    ch2.challenge_id, ["567890"]
+                )
+                assert result == AUTH_SUCCESSFUL
+                thread.join(5)
+                assert outcome.get("result") == []
+                assert ts.is_authenticated()
+                # the client was offered both rounds of distinct prompts
+                assert prompts_seen == [
+                    ("round-0", [("PIN:", False)]),
+                    ("round-1", [("OTP:", False)]),
+                ]
+            finally:
+                thread.join(5)
+
+    def stale_or_previous_round_answers_rejected(self):
+        """
+        Unknown ids and ids from earlier rounds cannot submit answers.
+        """
+        serv = ChallengeServer(
+            [
+                ([("PIN:", False)], ["1234"]),
+                ([("OTP:", False)], ["567890"]),
+            ]
+        )
+        with server(defer=True, server_obj=serv) as (tc, ts):
+            thread, outcome = _auth_interactive_in_thread(
+                tc, "commie", _ignoring_handler([])
+            )
+            try:
+                wait_until(lambda: _challenge_pending(ts))
+                ch1 = ts.get_interactive_challenge()
+                # unknown challenge id
+                with raises(SSHException):
+                    ts.submit_interactive_responses("no-such-id", ["1234"])
+                # answer round 1, moving to round 2
+                ch2 = ts.submit_interactive_responses(
+                    ch1.challenge_id, ["1234"]
+                )
+                # the previous round's id is now stale
+                with raises(SSHException):
+                    ts.submit_interactive_responses(
+                        ch1.challenge_id, ["1234"]
+                    )
+                # the current round still accepts its answers
+                result = ts.submit_interactive_responses(
+                    ch2.challenge_id, ["567890"]
+                )
+                assert result == AUTH_SUCCESSFUL
+                thread.join(5)
+                assert outcome.get("result") == []
+            finally:
+                thread.join(5)
+
+    def expiry_ends_wait_and_rejects_answers(self):
+        """
+        An expired challenge stops waiting and refuses its answers.
+        """
+        serv = ChallengeServer(
+            [([("PIN:", False)], ["1234"])], timeout=0.2
+        )
+        with server(defer=True, server_obj=serv, skip_verify=True) as (tc, ts):
+            thread, outcome = _auth_interactive_in_thread(
+                tc, "commie", _ignoring_handler([])
+            )
+            try:
+                wait_until(lambda: _challenge_pending(ts))
+                challenge = ts.get_interactive_challenge()
+                # the expiry timer ends the wait on its own
+                assert challenge.wait(5)
+                assert challenge.resolution == "expired"
+                wait_until(lambda: _challenge_cleared(ts))
+                # late answers are rejected
+                with raises(SSHException):
+                    ts.submit_interactive_responses(
+                        challenge.challenge_id, ["1234"]
+                    )
+                # the client sees the authentication fail
+                thread.join(5)
+                assert isinstance(
+                    outcome.get("error"), AuthenticationException
+                )
+            finally:
+                thread.join(5)
+
+    def cancellation_ends_wait(self):
+        """
+        Cancelling a challenge ends its wait and fails the auth attempt.
+        """
+        serv = ChallengeServer([([("PIN:", False)], ["1234"])])
+        with server(defer=True, server_obj=serv, skip_verify=True) as (tc, ts):
+            thread, outcome = _auth_interactive_in_thread(
+                tc, "commie", _ignoring_handler([])
+            )
+            try:
+                wait_until(lambda: _challenge_pending(ts))
+                challenge = ts.get_interactive_challenge()
+                # a mismatched id cancels nothing
+                assert ts.cancel_interactive_challenge("bogus") is False
+                assert ts.get_interactive_challenge() is challenge
+                # cancelling ends the wait
+                assert ts.cancel_interactive_challenge() is True
+                assert challenge.done.is_set()
+                assert challenge.resolution == "cancelled"
+                # nothing left to cancel or answer
+                assert ts.cancel_interactive_challenge() is False
+                with raises(SSHException):
+                    ts.submit_interactive_responses(
+                        challenge.challenge_id, ["1234"]
+                    )
+                thread.join(5)
+                assert isinstance(
+                    outcome.get("error"), AuthenticationException
+                )
+            finally:
+                thread.join(5)
+
+    def connection_close_ends_wait(self):
+        """
+        Closing the connection resolves any pending challenge.
+        """
+        serv = ChallengeServer([([("PIN:", False)], ["1234"])])
+        with server(defer=True, server_obj=serv, skip_verify=True) as (tc, ts):
+            thread, outcome = _auth_interactive_in_thread(
+                tc, "commie", _ignoring_handler([])
+            )
+            try:
+                wait_until(lambda: _challenge_pending(ts))
+                challenge = ts.get_interactive_challenge()
+                tc.close()
+                assert challenge.wait(5)
+                assert challenge.resolution == "closed"
+                with raises(SSHException):
+                    ts.submit_interactive_responses(
+                        challenge.challenge_id, ["1234"]
+                    )
+            finally:
+                thread.join(5)
 
 
 class SHA2SignaturePubkeys:

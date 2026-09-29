@@ -223,6 +223,7 @@ def server(
     catch_error=False,
     transport_factory=None,
     server_transport_factory=None,
+    server_obj=None,
     defer=False,
     skip_verify=False,
 ):
@@ -252,6 +253,9 @@ def server(
         Like the same-named param in SSHClient: which Transport class to use.
     :param server_transport_factory:
         Like ``transport_factory``, but only impacts the server transport.
+    :param server_obj:
+        A `.ServerInterface` instance to use instead of the default
+        `TestServer`.
     :param bool defer:
         Whether to defer authentication during connecting.
 
@@ -287,7 +291,10 @@ def server(
         hostkey = RSAKey.from_private_key_file(_support("rsa.key"))
     ts.add_server_key(hostkey)
     event = threading.Event()
-    server = TestServer(allowed_keys=pubkeys)
+    server = (
+        server_obj if server_obj is not None
+        else TestServer(allowed_keys=pubkeys)
+    )
     assert not event.is_set()
     assert not ts.is_active()
     assert tc.get_username() is None

@@ -864,6 +864,9 @@ class Transport(threading.Thread, ClosingContextManager):
         if not self.active:
             return
         self.stop_thread()
+        if self.auth_handler is not None:
+            # end any out-of-band interactive challenge still waiting
+            self.auth_handler._close_interactive_challenge()
         for chan in list(self._channels.values()):
             chan._unlink()
         self.sock.close()
@@ -1656,6 +1659,63 @@ class Transport(threading.Thread, ClosingContextManager):
             username, handler, my_event, submethods
         )
         return self.auth_handler.wait_for_response(my_event)
+
+    def get_interactive_challenge(self):
+        """
+        Return the `.InteractiveChallenge` currently awaiting out-of-band
+        responses in server mode, or ``None`` if there isn't one.
+
+        This is how the business side of an asynchronous
+        ``"keyboard-interactive"`` exchange retrieves the question set (and
+        its unique ``challenge_id``) to be answered by another request.
+
+        .. versionadded:: 5.1
+        """
+        if self.auth_handler is None:
+            return None
+        return self.auth_handler.get_interactive_challenge()
+
+    def submit_interactive_responses(self, challenge_id, responses):
+        """
+        Submit responses for a pending `.InteractiveChallenge` in server
+        mode, resuming an asynchronous ``"keyboard-interactive"``
+        authentication.  This may be called from any thread (e.g. the
+        business request which collected the user's answers); the transport
+        thread is never blocked waiting for this call.
+
+        Returns the next `.InteractiveChallenge` if the server issues
+        another round of questions, or an ``AUTH_*`` result code when the
+        exchange finishes.
+
+        :param str challenge_id:
+            the ``challenge_id`` of the pending challenge; ids from earlier
+            rounds are rejected so stale answers cannot be reused
+        :param responses: list of `str` answers to the challenge prompts
+
+        :raises: `.SSHException` -- if no matching challenge is pending, or
+            the transport is closed
+        :raises: `.AuthenticationException` -- if the challenge has expired
+
+        .. versionadded:: 5.1
+        """
+        if self.auth_handler is None:
+            raise SSHException("No authentication in progress")
+        return self.auth_handler.submit_interactive_responses(
+            challenge_id, responses
+        )
+
+    def cancel_interactive_challenge(self, challenge_id=None):
+        """
+        Cancel the pending `.InteractiveChallenge` in server mode, if any,
+        ending its wait and failing the in-flight authentication attempt.
+
+        Returns ``True`` if a challenge was cancelled.
+
+        .. versionadded:: 5.1
+        """
+        if self.auth_handler is None:
+            return False
+        return self.auth_handler.cancel_interactive_challenge(challenge_id)
 
     def auth_interactive_dumb(self, username, handler=None, submethods=""):
         """

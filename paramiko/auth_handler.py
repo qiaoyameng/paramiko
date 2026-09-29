@@ -53,7 +53,7 @@ from paramiko.common import (
     cMSG_USERAUTH_SUCCESS,
 )
 from paramiko.message import Message
-from paramiko.server import InteractiveQuery
+from paramiko.server import InteractiveChallenge, InteractiveQuery
 from paramiko.ssh_exception import (
     AuthenticationException,
     BadAuthenticationType,
@@ -82,6 +82,14 @@ class AuthHandler:
         # for server mode:
         self.auth_username = None
         self.auth_fail_count = 0
+        # for server-mode asynchronous interactive challenges:
+        self.interactive_challenge = None
+        self._challenge_lock = threading.Lock()
+        self._challenge_timer = None
+        # stays True for a whole async exchange (across rounds and result
+        # sending), so in-protocol INFO_RESPONSEs are ignored even in the
+        # gaps around round transitions; reset by _close_interactive_challenge
+        self._async_interactive = False
 
     def _log(self, *args):
         return self.transport._log(*args)
@@ -145,8 +153,140 @@ class AuthHandler:
     def abort(self):
         if self.auth_event is not None:
             self.auth_event.set()
+        self._close_interactive_challenge()
 
     # ...internals...
+
+    def _begin_interactive_challenge(self, challenge):
+        # server mode: register a pending asynchronous challenge and send
+        # its prompts to the client, then let the transport thread go back
+        # to processing protocol messages. answers arrive later, via
+        # submit_interactive_responses.
+        with self._challenge_lock:
+            self._end_interactive_challenge_locked("superseded")
+            self.interactive_challenge = challenge
+            self._async_interactive = True
+            if challenge.timeout is not None:
+                timer = threading.Timer(
+                    challenge.timeout,
+                    self._expire_interactive_challenge,
+                    args=(challenge,),
+                )
+                timer.daemon = True
+                self._challenge_timer = timer
+                timer.start()
+        self._interactive_query(challenge)
+
+    def _end_interactive_challenge_locked(self, resolution):
+        # caller must hold self._challenge_lock
+        challenge = self.interactive_challenge
+        if challenge is not None:
+            challenge._resolve(resolution)
+            self.interactive_challenge = None
+        if self._challenge_timer is not None:
+            self._challenge_timer.cancel()
+            self._challenge_timer = None
+        return challenge
+
+    def _close_interactive_challenge(self):
+        with self._challenge_lock:
+            self._async_interactive = False
+            self._end_interactive_challenge_locked("closed")
+
+    def _expire_interactive_challenge(self, challenge):
+        with self._challenge_lock:
+            if self.interactive_challenge is not challenge:
+                return
+            self._end_interactive_challenge_locked("expired")
+        self._log(INFO, "Interactive challenge expired; failing auth")
+        self._fail_async_interactive()
+
+    def _fail_async_interactive(self):
+        # best-effort auth failure for the in-flight attempt; the transport
+        # may already be gone, and the wait has ended either way
+        try:
+            self._send_auth_result(
+                self.auth_username, "keyboard-interactive", AUTH_FAILED
+            )
+        except Exception:
+            pass
+
+    def get_interactive_challenge(self):
+        """
+        Return the currently pending `.InteractiveChallenge`, or ``None``.
+        """
+        with self._challenge_lock:
+            return self.interactive_challenge
+
+    def cancel_interactive_challenge(self, challenge_id=None):
+        """
+        Cancel the pending `.InteractiveChallenge`, if any, ending its wait
+        and failing the in-flight authentication attempt.
+
+        Returns ``True`` if a challenge was cancelled.
+        """
+        with self._challenge_lock:
+            challenge = self.interactive_challenge
+            if challenge is None:
+                return False
+            if challenge_id is not None and (
+                challenge.challenge_id != challenge_id
+            ):
+                return False
+            self._end_interactive_challenge_locked("cancelled")
+        self._log(INFO, "Interactive challenge cancelled; failing auth")
+        self._fail_async_interactive()
+        return True
+
+    def submit_interactive_responses(self, challenge_id, responses):
+        """
+        Submit out-of-band responses for the pending `.InteractiveChallenge`
+        identified by ``challenge_id``, resuming the authentication.
+
+        Returns the next `.InteractiveChallenge` if the server issues
+        another round, or an ``AUTH_*`` result code otherwise.
+
+        :raises: `.SSHException` if there is no pending challenge with this
+            id (unknown, already answered, cancelled, or superseded by a
+            newer round), or if the transport is closed.
+        :raises: `.AuthenticationException` if the challenge has expired.
+        """
+        with self._challenge_lock:
+            challenge = self.interactive_challenge
+            if challenge is None or challenge.challenge_id != challenge_id:
+                raise SSHException(
+                    "No pending interactive challenge with id {!r}".format(
+                        challenge_id
+                    )
+                )
+            if challenge.expired:
+                self._end_interactive_challenge_locked("expired")
+                expired = True
+            else:
+                expired = False
+                if not self.transport.is_active():
+                    self._end_interactive_challenge_locked("closed")
+                    raise SSHException("Transport is closed")
+                self._end_interactive_challenge_locked("answered")
+        if expired:
+            # fail the in-flight attempt, as the expiry timer would have
+            self._fail_async_interactive()
+            raise AuthenticationException(
+                "Interactive challenge has expired"
+            )
+        # run the server callback outside the lock; it may take a while
+        result = (
+            self.transport.server_object.check_auth_interactive_challenge_response(  # noqa
+                challenge, list(responses)
+            )
+        )
+        if isinstance(result, InteractiveChallenge):
+            self._begin_interactive_challenge(result)
+            return result
+        self._send_auth_result(
+            self.auth_username, "keyboard-interactive", result
+        )
+        return result
 
     def _request_auth(self):
         m = Message()
@@ -437,6 +577,9 @@ class AuthHandler:
             self._disconnect_no_more_auth()
             return
         self.auth_username = username
+        # a fresh auth attempt ends any async challenge left over from a
+        # previous one
+        self._close_interactive_challenge()
 
         if method == "none":
             result = self.transport.server_object.check_auth_none(username)
@@ -513,6 +656,16 @@ class AuthHandler:
                     result = AUTH_FAILED
         elif method == "keyboard-interactive":
             submethods = m.get_string()
+            result = (
+                self.transport.server_object.check_auth_interactive_challenge(
+                    username, submethods
+                )
+            )
+            if isinstance(result, InteractiveChallenge):
+                # asynchronous challenge: register it, prompt the client,
+                # and return without waiting for the answers
+                self._begin_interactive_challenge(result)
+                return
             result = self.transport.server_object.check_auth_interactive(
                 username, submethods
             )
@@ -594,10 +747,23 @@ class AuthHandler:
     def _parse_userauth_info_response(self, m):
         if not self.transport.server_mode:
             raise SSHException("Illegal info response from server")
+        if self.authenticated:
+            # ignore stragglers from an already-completed exchange
+            return
         n = m.get_int()
         responses = []
         for i in range(n):
             responses.append(m.get_text())
+        if self._async_interactive:
+            # asynchronous challenge mode: answers only arrive out-of-band,
+            # via submit_interactive_responses; in-protocol responses are
+            # not consumed, so a stale client response can never be
+            # mistaken for the current round's answers
+            self._log(
+                DEBUG,
+                "Ignoring info response; awaiting out-of-band answers",
+            )
+            return
         result = self.transport.server_object.check_auth_interactive_response(
             responses
         )

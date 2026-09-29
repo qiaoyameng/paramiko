@@ -21,6 +21,8 @@
 """
 
 import threading
+import time
+import uuid
 
 from paramiko import util
 from paramiko.common import (
@@ -232,6 +234,70 @@ class ServerInterface:
             is successful, but authentication must continue; otherwise an
             object containing queries for the user
         :rtype: int or `.InteractiveQuery`
+        """
+        return AUTH_FAILED
+
+    def check_auth_interactive_challenge(self, username, submethods):
+        """
+        Begin an asynchronous interactive authentication challenge, if
+        supported.  Override this method in server mode when the answers to
+        a ``"keyboard-interactive"`` challenge cannot be produced inline
+        (for example, when they arrive via a separate business request) and
+        you cannot afford to block Paramiko's network thread while waiting
+        for them.
+
+        Return an `.InteractiveChallenge` object containing the prompts for
+        the user.  The challenge is registered under a unique
+        ``challenge_id`` and the prompts are forwarded to the client, but
+        unlike `check_auth_interactive`, no answer is expected on this call
+        stack: the caller later submits responses via
+        `.Transport.submit_interactive_responses`, which resumes the
+        authentication by invoking `check_auth_interactive_challenge_response`.
+
+        Return ``AUTH_FAILED`` if this auth method isn't supported.  The
+        default implementation always returns ``AUTH_FAILED``, in which case
+        the synchronous `check_auth_interactive` interface is consulted
+        instead.
+
+        :param str username: the username of the authenticating client
+        :param str submethods:
+            a comma-separated list of methods preferred by the client
+            (usually empty)
+        :return:
+            ``AUTH_FAILED`` if this auth method isn't supported; otherwise an
+            `.InteractiveChallenge` containing queries for the user
+        :rtype: int or `.InteractiveChallenge`
+
+        .. versionadded:: 5.1
+        """
+        return AUTH_FAILED
+
+    def check_auth_interactive_challenge_response(self, challenge, responses):
+        """
+        Continue or finish an asynchronous interactive authentication
+        challenge.  This is called in server mode when responses are
+        submitted for a pending `.InteractiveChallenge` (via
+        `.Transport.submit_interactive_responses`).
+
+        Return ``AUTH_FAILED`` if the responses are not accepted,
+        ``AUTH_SUCCESSFUL`` if they complete the authentication, or
+        ``AUTH_PARTIALLY_SUCCESSFUL`` if more authentication is required.
+        To issue another round of questions, return a new
+        `.InteractiveChallenge`; its fresh ``challenge_id`` must be used for
+        the next submission (responses submitted for earlier rounds are
+        rejected).
+
+        The default implementation always returns ``AUTH_FAILED``.
+
+        :param challenge: the `.InteractiveChallenge` being answered
+        :param responses: list of `str` responses for the challenge prompts
+        :return:
+            ``AUTH_FAILED`` if the authentication fails; ``AUTH_SUCCESSFUL``
+            if it succeeds; ``AUTH_PARTIALLY_SUCCESSFUL`` if authentication
+            must continue; otherwise a new `.InteractiveChallenge`
+        :rtype: int or `.InteractiveChallenge`
+
+        .. versionadded:: 5.1
         """
         return AUTH_FAILED
 
@@ -559,6 +625,79 @@ class InteractiveQuery:
             ``False`` if not (for a password or similar)
         """
         self.prompts.append((prompt, echo))
+
+
+class InteractiveChallenge(InteractiveQuery):
+    """
+    A query (set of prompts) for asynchronous interactive authentication.
+
+    Unlike `.InteractiveQuery`, which is answered synchronously within the
+    auth protocol exchange, an `InteractiveChallenge` carries a unique
+    ``challenge_id`` and is answered out-of-band: the server application
+    hands the question set to another request, which later submits the
+    answers via `.Transport.submit_interactive_responses`.
+
+    A challenge stops waiting for answers once it is answered, superseded by
+    a newer round, expired, cancelled, or when the connection closes; the
+    `done` event is set in all of these cases, and `resolution` records
+    which one occurred.  Answers submitted for an expired, cancelled, or
+    superseded (previous-round) challenge are rejected.
+    """
+
+    def __init__(self, name="", instructions="", *prompts, timeout=None):
+        """
+        Create a new interactive challenge.  Takes the same prompt arguments
+        as `.InteractiveQuery`, plus an optional expiry.
+
+        :param float timeout:
+            number of seconds the challenge stays valid, or ``None`` (the
+            default) to never expire.  Once expired, the challenge stops
+            waiting and its answers are rejected.
+        """
+        super().__init__(name, instructions, *prompts)
+        self.challenge_id = uuid.uuid4().hex
+        self.timeout = timeout
+        self.creation_time = time.time()
+        self._done = threading.Event()
+        self._resolution = None
+
+    @property
+    def expired(self):
+        """
+        ``True`` if this challenge has passed its ``timeout``.
+        """
+        return self.timeout is not None and (
+            time.time() >= self.creation_time + self.timeout
+        )
+
+    @property
+    def done(self):
+        """
+        `threading.Event` set once the challenge stops waiting for answers.
+        """
+        return self._done
+
+    @property
+    def resolution(self):
+        """
+        Why the challenge stopped waiting: one of ``"answered"``,
+        ``"superseded"``, ``"expired"``, ``"cancelled"`` or ``"closed"``;
+        ``None`` while the challenge is still pending.
+        """
+        return self._resolution
+
+    def wait(self, timeout=None):
+        """
+        Block until the challenge stops waiting for answers, or ``timeout``
+        seconds pass.  Returns ``True`` if the challenge finished.
+        """
+        return self._done.wait(timeout)
+
+    def _resolve(self, resolution):
+        # (internal) mark the challenge as no longer waiting for answers
+        if not self._done.is_set():
+            self._resolution = resolution
+            self._done.set()
 
 
 class SubsystemHandler(threading.Thread):

@@ -65,7 +65,12 @@ from paramiko.ssh_exception import (
     ProxyCommandFailure,
     SSHException,
 )
-from paramiko.server import ServerInterface, SubsystemHandler, InteractiveQuery
+from paramiko.server import (
+    ServerInterface,
+    SubsystemHandler,
+    InteractiveQuery,
+    InteractiveChallenge,
+)
 from paramiko.rsakey import RSAKey
 from paramiko.ecdsakey import ECDSAKey
 from paramiko.ed25519key import Ed25519Key
