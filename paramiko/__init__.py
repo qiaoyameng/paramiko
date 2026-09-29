@@ -51,6 +51,7 @@ from paramiko.channel import (
     ChannelFile,
     ChannelStderrFile,
     ChannelStdinFile,
+    ExitSignal,
 )
 from paramiko.ssh_exception import (
     AuthenticationException,

@@ -2,6 +2,16 @@
 Changelog
 =========
 
+- :feature:`-` Added support for the ``exit-signal`` channel request
+  (:rfc:`4254` section 6.10): servers can now report signal-based
+  termination via `Channel.send_exit_signal
+  <paramiko.channel.Channel.send_exit_signal>`, and clients can retrieve
+  the signal name, core-dump flag, error message, and language tag via
+  `Channel.recv_exit_signal
+  <paramiko.channel.Channel.recv_exit_signal>` (returning the new
+  `paramiko.channel.ExitSignal` tuple), distinct from ``exit-status``.
+  Duplicate or contradictory exit notifications are resolved
+  deterministically: the first one received wins.
 - :feature:`-` Added support for the ``mlkem768x25519-sha256`` post-quantum
   hybrid key exchange method described in
   ``draft-ietf-sshm-mlkem-hybrid-kex``. It pairs ML-KEM-768 (FIPS 203) with

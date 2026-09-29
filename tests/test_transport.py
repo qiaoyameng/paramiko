@@ -366,6 +366,112 @@ class TransportTest(unittest.TestCase):
         self.assertEqual(23, chan.recv_exit_status())
         chan.close()
 
+    def test_exit_signal(self):
+        """
+        verify that send_exit_signal/recv_exit_signal convey the signal
+        name, core dump flag, error message, and language tag, and are
+        distinct from exit-status.
+        """
+        self.setup_test_server()
+
+        chan = self.tc.open_session()
+        schan = self.ts.accept(1.0)
+        chan.exec_command("yes")
+        schan.send("Hello there.\n")
+        self.assertTrue(not chan.exit_signal_ready())
+        schan.send_exit_signal(
+            "KILL",
+            core_dumped=True,
+            error_message="Process killed",
+            language="en-US",
+        )
+        schan.close()
+
+        f = chan.makefile()
+        self.assertEqual("Hello there.\n", f.readline())
+        self.assertEqual("", f.readline())
+        count = 0
+        while not chan.exit_signal_ready():
+            time.sleep(0.1)
+            count += 1
+            if count > 50:
+                raise Exception("timeout")
+        exit_signal = chan.recv_exit_signal()
+        self.assertEqual("KILL", exit_signal.signal)
+        self.assertEqual(True, exit_signal.core_dumped)
+        self.assertEqual("Process killed", exit_signal.error_message)
+        self.assertEqual("en-US", exit_signal.language)
+        # an exit-signal is not an exit-status
+        self.assertEqual(-1, chan.recv_exit_status())
+        chan.close()
+
+    def test_exit_signal_after_eof(self):
+        """
+        verify that an exit notification sent after the server's EOF is
+        still received, and that stderr sent before the EOF stays readable.
+        """
+        self.setup_test_server()
+
+        chan = self.tc.open_session()
+        schan = self.ts.accept(1.0)
+        chan.exec_command("yes")
+        schan.send_stderr("Something went wrong\n")
+        # EOF arrives before the exit notification
+        schan.shutdown_write()
+        schan.send_exit_signal("TERM", error_message="terminated")
+        schan.close()
+
+        # stderr body is still fully readable after EOF
+        chunks = []
+        while True:
+            data = chan.recv_stderr(1024)
+            if not data:
+                break
+            chunks.append(data)
+        self.assertEqual(b"Something went wrong\n", b"".join(chunks))
+        # waiting for the result does not hang despite the earlier EOF
+        exit_signal = chan.recv_exit_signal()
+        self.assertIsNotNone(exit_signal)
+        self.assertEqual("TERM", exit_signal.signal)
+        self.assertEqual(False, exit_signal.core_dumped)
+        self.assertEqual("terminated", exit_signal.error_message)
+        self.assertEqual("", exit_signal.language)
+        chan.close()
+
+    def test_exit_notification_first_wins(self):
+        """
+        verify that duplicate or contradictory exit notifications are
+        resolved deterministically: the first one received wins.
+        """
+        self.setup_test_server()
+
+        # exit-status followed by a contradictory exit-signal
+        chan = self.tc.open_session()
+        schan = self.ts.accept(1.0)
+        chan.exec_command("yes")
+        schan.send_exit_status(23)
+        schan.send_exit_signal("KILL")
+        schan.send_exit_status(42)
+        schan.close()
+        self.assertEqual(23, chan.recv_exit_status())
+        self.assertIsNone(chan.recv_exit_signal())
+        chan.close()
+
+        # exit-signal followed by a contradictory exit-status
+        chan = self.tc.open_session()
+        schan = self.ts.accept(1.0)
+        chan.exec_command("yes")
+        schan.send_exit_signal("SEGV", core_dumped=True)
+        schan.send_exit_signal("KILL")
+        schan.send_exit_status(1)
+        schan.close()
+        exit_signal = chan.recv_exit_signal()
+        self.assertIsNotNone(exit_signal)
+        self.assertEqual("SEGV", exit_signal.signal)
+        self.assertEqual(True, exit_signal.core_dumped)
+        self.assertEqual(-1, chan.recv_exit_status())
+        chan.close()
+
     def test_select(self):
         """
         verify that select() on a channel works.

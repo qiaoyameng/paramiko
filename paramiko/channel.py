@@ -26,6 +26,7 @@ import socket
 import time
 import threading
 
+from collections import namedtuple
 from functools import wraps
 
 from paramiko import util
@@ -36,6 +37,7 @@ from paramiko.common import (
     cMSG_CHANNEL_EXTENDED_DATA,
     DEBUG,
     ERROR,
+    WARNING,
     cMSG_CHANNEL_SUCCESS,
     cMSG_CHANNEL_FAILURE,
     cMSG_CHANNEL_EOF,
@@ -47,6 +49,25 @@ from paramiko.file import BufferedFile
 from paramiko.buffered_pipe import BufferedPipe, PipeTimeout
 from paramiko import pipe
 from paramiko.util import ClosingContextManager
+
+
+#: Result of a remote process terminated by a signal, as reported by the
+#: ``exit-signal`` channel request defined in :rfc:`4254` section 6.10.
+#: Returned by `.Channel.recv_exit_signal` and also stored on the channel as
+#: `.Channel.exit_signal`.
+ExitSignal = namedtuple(
+    "ExitSignal",
+    [
+        #: name of the signal, without the ``SIG`` prefix (e.g. ``"KILL"``)
+        "signal",
+        #: whether the remote process produced a core dump
+        "core_dumped",
+        #: human-readable error message supplied by the server (may be empty)
+        "error_message",
+        #: language tag of the error message, per :rfc:`3066` (may be empty)
+        "language",
+    ],
+)
 
 
 def open_only(func):
@@ -131,6 +152,10 @@ class Channel(ClosingContextManager):
         self.event_ready = False
         self.combine_stderr = False
         self.exit_status = -1
+        #: `ExitSignal` sent by the server, or ``None`` if the remote
+        #: process did not report dying to a signal
+        self.exit_signal = None
+        self._exit_notification_received = False
         self.origin_addr = None
 
     def __del__(self):
@@ -420,6 +445,81 @@ class Channel(ClosingContextManager):
         m.add_string("exit-status")
         m.add_boolean(False)
         m.add_int(status)
+        self.transport._send_user_message(m)
+
+    def exit_signal_ready(self):
+        """
+        Return true if the remote process has exited and returned an exit
+        signal (or any other exit notification, or the channel has closed).
+        You may use this to poll the process status if you don't want to
+        block in `recv_exit_signal`.
+
+        :return:
+            ``True`` if `recv_exit_signal` will return immediately, else
+            ``False``.
+
+        .. versionadded:: 5.1
+        """
+        return self.closed or self.status_event.is_set()
+
+    def recv_exit_signal(self):
+        """
+        Return the exit signal sent by the process on the server, if any.
+        This is the signal-based counterpart of `recv_exit_status`: servers
+        report abnormal termination of a command via the ``exit-signal``
+        request (:rfc:`4254` section 6.10) instead of ``exit-status``.
+
+        If the remote process hasn't finished yet, this method will wait
+        until it does, or until the channel is closed; it does not require
+        the server's EOF to arrive in any particular order relative to the
+        exit notification.  If the process exited normally (or the server
+        sent no exit notification before closing), ``None`` is returned.
+
+        :return:
+            an `ExitSignal` (with the signal name, core-dump flag, error
+            message, and language tag sent by the server), or ``None`` if
+            the remote process was not reported as killed by a signal.
+
+        .. versionadded:: 5.1
+        """
+        self.status_event.wait()
+        assert self.status_event.is_set()
+        return self.exit_signal
+
+    def send_exit_signal(
+        self, signal, core_dumped=False, error_message="", language=""
+    ):
+        """
+        Send an ``exit-signal`` notification for an executed command to the
+        client, indicating that the command was terminated by a signal.
+        (This really only makes sense in server mode.)  This is the
+        signal-based counterpart of `send_exit_status`; the two are mutually
+        exclusive per connection -- clients only honor the first exit
+        notification received.
+
+        :param str signal:
+            name of the signal that killed the process, without the ``SIG``
+            prefix (for example ``"KILL"`` or ``"TERM"``)
+        :param bool core_dumped: whether the process produced a core dump
+        :param str error_message:
+            a human-readable description of the error (may be empty)
+        :param str language:
+            language tag of ``error_message``, per :rfc:`3066` (may be
+            empty)
+
+        .. versionadded:: 5.1
+        """
+        # in many cases, the channel will not still be open here.
+        # that's fine.
+        m = Message()
+        m.add_byte(cMSG_CHANNEL_REQUEST)
+        m.add_int(self.remote_chanid)
+        m.add_string("exit-signal")
+        m.add_boolean(False)
+        m.add_string(signal)
+        m.add_boolean(core_dumped)
+        m.add_string(error_message)
+        m.add_string(language)
         self.transport._send_user_message(m)
 
     @open_only
@@ -1074,8 +1174,41 @@ class Channel(ClosingContextManager):
         server = self.transport.server_object
         ok = False
         if key == "exit-status":
-            self.exit_status = m.get_int()
-            self.status_event.set()
+            status = m.get_int()
+            # RFC 4254 section 6.10 expects at most one exit notification
+            # ("exit-status" or "exit-signal") per channel; resolve
+            # duplicates or contradictions deterministically: first wins.
+            if self._exit_notification_received:
+                self._log(
+                    WARNING,
+                    "Ignoring duplicate exit-status ({}) after initial "
+                    "exit notification".format(status),
+                )
+            else:
+                self._exit_notification_received = True
+                self.exit_status = status
+                self.status_event.set()
+            ok = True
+        elif key == "exit-signal":
+            signal = m.get_text()
+            core_dumped = m.get_boolean()
+            error_message = m.get_text()
+            language = m.get_text()
+            if self._exit_notification_received:
+                self._log(
+                    WARNING,
+                    "Ignoring exit-signal ({}) after initial exit "
+                    "notification".format(signal),
+                )
+            else:
+                self._exit_notification_received = True
+                self.exit_signal = ExitSignal(
+                    signal=signal,
+                    core_dumped=core_dumped,
+                    error_message=error_message,
+                    language=language,
+                )
+                self.status_event.set()
             ok = True
         elif key == "xon-xoff":
             # ignore
