@@ -33,7 +33,11 @@ from paramiko.client import (
     SSHClient,
     WarningPolicy,
 )
-from paramiko.auth_handler import AuthHandler
+from paramiko.auth_handler import (
+    AuthHandler,
+    InteractiveAuthSession,
+    InteractiveChallenge,
+)
 from paramiko.auth_strategy import (
     AuthFailure,
     AuthStrategy,

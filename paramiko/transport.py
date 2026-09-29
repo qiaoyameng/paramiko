@@ -39,7 +39,11 @@ from cryptography.hazmat.primitives.ciphers import (
 
 import paramiko
 from paramiko import util
-from paramiko.auth_handler import AuthHandler, AuthOnlyHandler
+from paramiko.auth_handler import (
+    AuthHandler,
+    AuthOnlyHandler,
+    InteractiveAuthSession,
+)
 from paramiko.channel import Channel
 from paramiko.common import (
     CONNECTION_FAILED_CODE,
@@ -1657,6 +1661,60 @@ class Transport(threading.Thread, ClosingContextManager):
         )
         return self.auth_handler.wait_for_response(my_event)
 
+    def auth_interactive_challenge(
+        self, username, submethods="", challenge_timeout=None
+    ):
+        """
+        Begin challenge/response style keyboard-interactive authentication.
+
+        Unlike `.auth_interactive`, no handler callback is involved: each
+        round of server questions is published as an
+        `.InteractiveChallenge` (carrying a unique ``id``) on the returned
+        `.InteractiveAuthSession`, and the caller submits answers whenever
+        they are available -- potentially from a different thread or
+        business request. The transport's network thread is never blocked
+        waiting for answers, so it keeps processing protocol messages while
+        a challenge is pending.
+
+        Example::
+
+            session = transport.auth_interactive_challenge(username)
+            challenge = session.wait_challenge()
+            while challenge is not None:
+                answers = collect_answers(challenge)
+                challenge = session.submit(challenge.id, answers)
+
+        Challenges may be bounded in time via ``challenge_timeout``; the
+        session may also be terminated early via
+        `.InteractiveAuthSession.cancel`, and ends automatically if the
+        connection closes. Answers submitted for an expired or superseded
+        challenge id are rejected.
+
+        :param str username: the username to authenticate as
+        :param str submethods: a string list of desired submethods (optional)
+        :param float challenge_timeout:
+            seconds each issued challenge remains answerable before it
+            expires and the authentication fails, or ``None`` (the default)
+            for no per-challenge expiry
+        :return: an `.InteractiveAuthSession`
+
+        :raises: `.SSHException` -- if there is no existing session
+
+        .. versionadded:: 5.0
+        """
+        if (not self.active) or (not self.initial_kex_done):
+            # we should never try to authenticate unless we're on a secure link
+            raise SSHException("No existing session")
+        my_event = threading.Event()
+        self.auth_handler = AuthHandler(self)
+        session = InteractiveAuthSession(
+            self, self.auth_handler, my_event, challenge_timeout
+        )
+        self.auth_handler.auth_interactive_challenge(
+            username, session, my_event, submethods
+        )
+        return session
+
     def auth_interactive_dumb(self, username, handler=None, submethods=""):
         """
         Authenticate to the server interactively but dumber.
@@ -1995,6 +2053,11 @@ class Transport(threading.Thread, ClosingContextManager):
             reply.add_int(OPEN_FAILED_ADMINISTRATIVELY_PROHIBITED)
             reply.add_string("")
             reply.add_string("en")
+        else:
+            # Anything else post-auth (eg global request responses) is not
+            # something we need to reject; let normal dispatch handle it
+            # rather than sending an empty (and thus invalid) message.
+            return None
         # NOTE: Post-open channel messages do not need checking; the above will
         # reject attempts to open channels, meaning that even if a malicious
         # user tries to send a MSG_CHANNEL_REQUEST, it will simply fall under

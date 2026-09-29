@@ -225,6 +225,7 @@ def server(
     server_transport_factory=None,
     defer=False,
     skip_verify=False,
+    server_object=None,
 ):
     """
     SSH server contextmanager for testing.
@@ -245,6 +246,9 @@ def server(
         Kwargs to use for ``connect()`` on the client.
     :param pubkeys:
         List of public keys for auth.
+    :param server_object:
+        Custom `ServerInterface` to use; if None, a default `TestServer` is
+        created (honoring ``pubkeys``).
     :param catch_error:
         Whether to capture connection errors & yield from contextmanager.
         Necessary for connection_time exception testing.
@@ -287,7 +291,11 @@ def server(
         hostkey = RSAKey.from_private_key_file(_support("rsa.key"))
     ts.add_server_key(hostkey)
     event = threading.Event()
-    server = TestServer(allowed_keys=pubkeys)
+    server = (
+        server_object
+        if server_object is not None
+        else TestServer(allowed_keys=pubkeys)
+    )
     assert not event.is_set()
     assert not ts.is_active()
     assert tc.get_username() is None

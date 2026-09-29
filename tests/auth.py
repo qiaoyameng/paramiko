@@ -4,6 +4,8 @@ Tests focusing primarily on the authentication step.
 Thus, they concern AuthHandler and AuthStrategy, with a side of Transport.
 """
 
+import time
+import threading
 from logging import Logger
 from unittest.mock import Mock
 
@@ -19,6 +21,7 @@ from paramiko import (
     BadAuthenticationType,
     Ed25519Key,
     InMemoryPrivateKey,
+    InteractiveQuery,
     NoneAuth,
     OnDiskPrivateKey,
     Password,
@@ -28,8 +31,10 @@ from paramiko import (
     SourceResult,
     SSHException,
 )
+from paramiko.common import AUTH_FAILED, AUTH_SUCCESSFUL
 
 from ._util import (
+    TestServer,
     _support,
     server,
     unicodey,
@@ -147,6 +152,161 @@ class AuthHandler_:
             tc.auth_timeout = 1  # 1 second, to speed up test
             tc.auth_password("unresponsive-server", "hello")
             assert "Authentication timeout" in str(info.value)
+
+
+class TwoRoundServer(TestServer):
+    """
+    Local server issuing two different rounds of keyboard-interactive
+    prompts before granting access.
+    """
+
+    def get_allowed_auths(self, username):
+        if username == "tworound":
+            return "keyboard-interactive"
+        return super().get_allowed_auths(username)
+
+    def check_auth_interactive(self, username, submethods):
+        if username == "tworound":
+            self.username = username
+            return InteractiveQuery(
+                "round-one", "First set of questions.", ("First:", True)
+            )
+        return AUTH_FAILED
+
+    def check_auth_interactive_response(self, responses):
+        if getattr(self, "username", None) == "tworound":
+            if responses == ["alpha"]:
+                return InteractiveQuery(
+                    "round-two",
+                    "Second set of questions.",
+                    ("Second:", False),
+                )
+            if responses == ["beta"]:
+                return AUTH_SUCCESSFUL
+        return AUTH_FAILED
+
+
+class ChallengeAuth_:
+    """
+    Challenge/response style keyboard-interactive client auth, where answers
+    are submitted out-of-band instead of via a network-thread callback.
+    """
+
+    def two_rounds_and_protocol_messages_while_waiting(self):
+        """
+        verify a two-round challenge auth succeeds, and that the transport
+        keeps processing protocol messages while an answer is outstanding.
+        """
+        srv = TwoRoundServer()
+        with server(defer=True, server_object=srv) as (tc, ts):
+            session = tc.auth_interactive_challenge("tworound")
+            first = session.wait_challenge(timeout=5)
+            assert first.title == "round-one"
+            assert first.instructions == "First set of questions."
+            assert first.prompts == [("First:", True)]
+            assert first.id
+            # While the answer is still outstanding, the transport must keep
+            # processing protocol traffic in both directions.
+            # A full rekey works mid-challenge (if the network thread were
+            # blocked waiting for answers, this would deadlock).
+            tc.renegotiate_keys()
+            # Server->client requests get replies too (denied here, but the
+            # round trip completing at all is what matters).
+            replies = {}
+
+            def ask_server_side():
+                replies["got"] = ts.global_request(
+                    "not-a-real-request", wait=True
+                )
+
+            asker = threading.Thread(target=ask_server_side)
+            asker.daemon = True
+            asker.start()
+            asker.join(5)
+            assert not asker.is_alive()
+            # And the pending challenge survives all that protocol traffic.
+            assert session.pending_challenge is first
+            # Answer round one; server poses a different second round.
+            second = session.submit(first.id, ["alpha"], timeout=5)
+            assert second.title == "round-two"
+            assert second.prompts == [("Second:", False)]
+            assert second.id != first.id
+            # Answer round two; auth completes.
+            assert session.submit(second.id, ["beta"], timeout=5) is None
+            assert session.allowed_types == []
+            assert tc.is_authenticated()
+
+    def stale_and_unknown_challenge_ids_are_rejected(self):
+        """
+        verify answers for unknown or previous-round challenge ids are
+        rejected and never sent to the server.
+        """
+        with server(defer=True, server_object=TwoRoundServer()) as (tc, ts):
+            session = tc.auth_interactive_challenge("tworound")
+            first = session.wait_challenge(timeout=5)
+            # Unknown id: rejected, and the session stays alive.
+            with raises(AuthenticationException):
+                session.submit("bogus-id", ["alpha"])
+            second = session.submit(first.id, ["alpha"], timeout=5)
+            # The previous round's id must not be reusable for this round.
+            with raises(AuthenticationException):
+                session.submit(first.id, ["beta"])
+            # The current round is still answerable afterwards.
+            assert session.submit(second.id, ["beta"], timeout=5) is None
+            assert tc.is_authenticated()
+
+    def expired_challenge_ends_wait_and_rejects_answers(self):
+        """
+        verify a challenge expiring ends the authentication wait, and that
+        late answers for it are rejected.
+        """
+        with server(defer=True, server_object=TwoRoundServer()) as (tc, ts):
+            session = tc.auth_interactive_challenge(
+                "tworound", challenge_timeout=0.3
+            )
+            first = session.wait_challenge(timeout=5)
+            assert first.expires_at is not None
+            time.sleep(0.6)
+            assert first.expired
+            with raises(AuthenticationException, match="expired"):
+                session.submit(first.id, ["alpha"])
+            # The overall wait is over as well.
+            with raises(AuthenticationException, match="expired"):
+                session.wait_challenge(timeout=5)
+
+    def cancellation_ends_wait(self):
+        """
+        verify cancelling a session ends the wait and rejects further
+        answers.
+        """
+        with server(defer=True, server_object=TwoRoundServer()) as (tc, ts):
+            session = tc.auth_interactive_challenge("tworound")
+            first = session.wait_challenge(timeout=5)
+            session.cancel()
+            with raises(AuthenticationException, match="cancelled"):
+                session.submit(first.id, ["alpha"])
+            with raises(AuthenticationException, match="cancelled"):
+                session.wait_challenge(timeout=5)
+
+    def connection_close_ends_wait(self):
+        """
+        verify the wait ends with an auth failure when the connection drops
+        while a challenge is pending.
+        """
+        with server(defer=True, server_object=TwoRoundServer()) as (tc, ts):
+            session = tc.auth_interactive_challenge("tworound")
+            first = session.wait_challenge(timeout=5)
+            ts.close()
+            # Wait until the client transport notices the dropped connection.
+            for _ in range(50):
+                if not tc.is_active():
+                    break
+                time.sleep(0.1)
+            assert not tc.is_active()
+            with raises(AuthenticationException):
+                session.wait_challenge(timeout=5)
+            with raises(AuthenticationException):
+                session.submit(first.id, ["alpha"])
 
 
 class SHA2SignaturePubkeys:

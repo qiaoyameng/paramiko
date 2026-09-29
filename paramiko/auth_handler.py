@@ -22,6 +22,7 @@
 
 import threading
 import time
+import secrets
 import weakref
 
 from paramiko.common import (
@@ -78,6 +79,7 @@ class AuthHandler:
         self.password = None
         self.private_key = None
         self.interactive_handler = None
+        self.challenge_session = None
         self.submethods = None
         # for server mode:
         self.auth_username = None
@@ -142,9 +144,30 @@ class AuthHandler:
         finally:
             self.transport.lock.release()
 
+    def auth_interactive_challenge(
+        self, username, session, event, submethods=""
+    ):
+        """
+        Like `auth_interactive`, but instead of a synchronous handler, server
+        questions are published as `.InteractiveChallenge` objects on the
+        given `.InteractiveAuthSession`, leaving the network thread free.
+        """
+        self.transport.lock.acquire()
+        try:
+            self.auth_event = event
+            self.auth_method = "keyboard-interactive"
+            self.username = username
+            self.challenge_session = session
+            self.submethods = submethods
+            self._request_auth()
+        finally:
+            self.transport.lock.release()
+
     def abort(self):
         if self.auth_event is not None:
             self.auth_event.set()
+        if self.challenge_session is not None:
+            self.challenge_session._abort()
 
     # ...internals...
 
@@ -580,6 +603,12 @@ class AuthHandler:
         prompt_list = []
         for i in range(prompts):
             prompt_list.append((m.get_text(), m.get_boolean()))
+        if self.challenge_session is not None:
+            # Challenge mode: publish the questions and return immediately,
+            # so the network thread keeps processing protocol messages while
+            # the caller gathers answers out-of-band.
+            self.challenge_session._offer(title, instructions, prompt_list)
+            return
         response_list = self.interactive_handler(
             title, instructions, prompt_list
         )
@@ -647,6 +676,270 @@ class AuthHandler:
             return self._server_handler_table
         else:
             return self._client_handler_table
+
+
+class InteractiveChallenge:
+    """
+    A single round of server-issued keyboard-interactive questions.
+
+    Instances are created by `.InteractiveAuthSession` (see
+    `.Transport.auth_interactive_challenge`) and carry a unique ``id`` which
+    must be quoted back when submitting answers, so answers belonging to an
+    expired or superseded round can never be applied to a later round.
+
+    .. versionadded:: 5.0
+    """
+
+    def __init__(self, title, instructions, prompts, timeout=None):
+        #: Unique token identifying this exact round of questions.
+        self.id = secrets.token_hex(16)
+        #: Dialog title sent by the server.
+        self.title = title
+        #: User instructions sent by the server.
+        self.instructions = instructions
+        #: List of ``(prompt, echo)`` tuples.
+        self.prompts = list(prompts)
+        self.created_at = time.time()
+        #: Epoch time after which answers for this round are rejected, or
+        #: ``None`` when the round never expires.
+        self.expires_at = (
+            None if timeout is None else self.created_at + timeout
+        )
+
+    @property
+    def expired(self):
+        return self.expires_at is not None and time.time() >= self.expires_at
+
+    def __repr__(self):
+        return "<InteractiveChallenge id={} prompts={}>".format(
+            self.id, len(self.prompts)
+        )
+
+
+class InteractiveAuthSession:
+    """
+    Client-side, challenge/response style keyboard-interactive auth session.
+
+    Created by `.Transport.auth_interactive_challenge`. Unlike
+    `.Transport.auth_interactive` -- which invokes a handler callback from
+    the transport's network thread -- this object simply publishes each
+    `.InteractiveChallenge` and lets the caller submit answers whenever they
+    become available (for example, from a different business request), while
+    the transport thread keeps processing protocol messages.
+
+    Typical usage::
+
+        session = transport.auth_interactive_challenge(username)
+        challenge = session.wait_challenge()
+        while challenge is not None:
+            answers = ask_user_somehow(challenge)
+            challenge = session.submit(challenge.id, answers)
+        # session.allowed_types now holds any remaining auth types.
+
+    .. versionadded:: 5.0
+    """
+
+    def __init__(self, transport, handler, event, challenge_timeout=None):
+        self.transport = weakref.proxy(transport)
+        self._handler = handler
+        self._event = event
+        #: Seconds each issued challenge remains answerable, or ``None``.
+        self.challenge_timeout = challenge_timeout
+        #: Auth types permissible for a next stage, once auth finished
+        #: (empty when authentication fully succeeded).
+        self.allowed_types = []
+        self._condition = threading.Condition()
+        self._pending = None
+        self._timer = None
+        self._finished = False
+        self._end_exception = None
+
+    @property
+    def pending_challenge(self):
+        """
+        The currently answerable `.InteractiveChallenge`, or ``None``.
+        """
+        with self._condition:
+            return self._pending
+
+    @property
+    def authenticated(self):
+        return self._handler.is_authenticated()
+
+    def wait_challenge(self, timeout=None):
+        """
+        Wait for the next round of server questions.
+
+        :param float timeout:
+            Maximum seconds to wait, or ``None`` to wait indefinitely.
+        :return:
+            The next `.InteractiveChallenge`, or ``None`` when authentication
+            completed without further questions (inspect `.allowed_types`
+            and `.authenticated` for the outcome).
+        :raises:
+            `.AuthenticationException` -- if authentication failed, the
+            pending challenge expired, the session was cancelled, the
+            connection closed, or ``timeout`` elapsed.
+        """
+        deadline = None if timeout is None else time.time() + timeout
+        with self._condition:
+            while True:
+                if self._end_exception is not None:
+                    raise self._end_exception
+                if self._finished:
+                    return None
+                if self._pending is not None:
+                    return self._pending
+                if self._event.is_set():
+                    # Auth ended (success, partial success, or failure);
+                    # wait_for_response returns allowed types or raises.
+                    self._finished = True
+                    self.allowed_types = self._handler.wait_for_response(
+                        self._event
+                    )
+                    return None
+                if not self.transport.is_active():
+                    self._finished = True
+                    self._end_exception = AuthenticationException(
+                        "Authentication failed: transport shut down or saw EOF"
+                    )
+                    raise self._end_exception
+                pause = 0.1
+                if deadline is not None:
+                    remaining = deadline - time.time()
+                    if remaining <= 0:
+                        raise AuthenticationException(
+                            "Timed out waiting for interactive challenge."
+                        )
+                    pause = min(pause, remaining)
+                self._condition.wait(pause)
+
+    def submit(self, challenge_id, answers, timeout=None):
+        """
+        Submit answers for a pending challenge and wait for what comes next.
+
+        :param str challenge_id:
+            The `.InteractiveChallenge.id` these answers belong to. Ids of
+            expired, cancelled, or earlier (superseded) rounds are rejected
+            and nothing is sent for them.
+        :param answers: list of response strings, one per prompt.
+        :param float timeout:
+            Maximum seconds to wait for the server's reaction, or ``None``
+            to wait indefinitely.
+        :return:
+            The next `.InteractiveChallenge` if the server asks more
+            questions, otherwise ``None`` (see `.wait_challenge`).
+        :raises:
+            `.AuthenticationException` -- on unknown/stale/expired
+            ``challenge_id``, or any of the `.wait_challenge` end conditions.
+        """
+        with self._condition:
+            if self._end_exception is not None:
+                raise self._end_exception
+            challenge = self._pending
+            if challenge is None or challenge.id != challenge_id:
+                raise AuthenticationException(
+                    "Unknown, expired, or superseded interactive challenge id."
+                )
+            if challenge.expired:
+                self._expire(challenge.id)
+                raise self._end_exception
+            self._pending = None
+            self._cancel_timer()
+        answers = list(answers)
+        m = Message()
+        m.add_byte(cMSG_USERAUTH_INFO_RESPONSE)
+        m.add_int(len(answers))
+        for answer in answers:
+            m.add_string(answer)
+        with self.transport.lock:
+            self.transport._send_message(m)
+        return self.wait_challenge(timeout)
+
+    def cancel(self):
+        """
+        Cancel the session, ending any current or future waits with an
+        `.AuthenticationException`.
+        """
+        with self._condition:
+            if self._finished:
+                return
+            if self._event is not None and self._event.is_set():
+                # Auth already concluded; nothing left to cancel.
+                self._finished = True
+                self._cancel_timer()
+                return
+            self._end(
+                AuthenticationException(
+                    "Interactive authentication cancelled."
+                )
+            )
+
+    # ...internals (called from AuthHandler / network thread)...
+
+    def _end(self, exception):
+        # Caller must hold self._condition.
+        self._finished = True
+        self._pending = None
+        self._cancel_timer()
+        self._end_exception = exception
+        # Fail the overall auth attempt too, so transport-level waiters end.
+        self.transport.saved_exception = exception
+        if self._event is not None:
+            self._event.set()
+        self._condition.notify_all()
+
+    def _offer(self, title, instructions, prompts):
+        with self._condition:
+            if self._finished:
+                return
+            self._cancel_timer()
+            challenge = InteractiveChallenge(
+                title, instructions, prompts, timeout=self.challenge_timeout
+            )
+            self._pending = challenge
+            if challenge.expires_at is not None:
+                self._timer = threading.Timer(
+                    challenge.expires_at - time.time(),
+                    self._expire,
+                    args=(challenge.id,),
+                )
+                self._timer.daemon = True
+                self._timer.start()
+            self._condition.notify_all()
+
+    def _expire(self, challenge_id):
+        with self._condition:
+            if self._pending is None or self._pending.id != challenge_id:
+                return
+            if self._event is not None and self._event.is_set():
+                # Auth already concluded; nothing left to expire.
+                return
+            self._end(
+                AuthenticationException(
+                    "Interactive challenge expired before answers were submitted."  # noqa
+                )
+            )
+
+    def _abort(self):
+        with self._condition:
+            if self._finished:
+                return
+            self._finished = True
+            self._pending = None
+            self._cancel_timer()
+            if self._end_exception is not None:
+                return
+            self._end_exception = AuthenticationException(
+                "Authentication failed: transport shut down or saw EOF"
+            )
+            self._condition.notify_all()
+
+    def _cancel_timer(self):
+        # Caller must hold self._condition.
+        if self._timer is not None:
+            self._timer.cancel()
+            self._timer = None
 
 
 class AuthOnlyHandler(AuthHandler):
