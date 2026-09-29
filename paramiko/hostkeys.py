@@ -20,14 +20,24 @@
 import binascii
 import os
 import re
+import struct
+import time
 from base64 import decodebytes, encodebytes
 from collections.abc import MutableMapping
 from hashlib import sha1
 from hmac import HMAC
 
+from paramiko.message import Message
 from paramiko.pkey import PKey, UnknownKeyType
 from paramiko.ssh_exception import SSHException
 from paramiko.util import b, constant_time_bytes_eq, get_logger, u
+
+
+# OpenSSH certificate types (see PROTOCOL.certkeys)
+CERT_TYPE_USER = 1
+CERT_TYPE_HOST = 2
+
+CERT_SUFFIX = "-cert-v01@openssh.com"
 
 
 class HostKeys(MutableMapping):
@@ -94,10 +104,14 @@ class HostKeys(MutableMapping):
                 except SSHException:
                     continue
                 if entry is not None:
-                    _hostnames = entry.hostnames
-                    for h in _hostnames:
-                        if self.check(h, entry.key):
-                            entry.hostnames.remove(h)
+                    # Marker entries (@cert-authority, @revoked) are not
+                    # interchangeable with plain host-key entries, so they
+                    # are never deduplicated against existing entries.
+                    if entry.marker is None:
+                        _hostnames = entry.hostnames
+                        for h in _hostnames:
+                            if self.check(h, entry.key):
+                                entry.hostnames.remove(h)
                     if len(entry.hostnames):
                         self._entries.append(entry)
 
@@ -181,6 +195,10 @@ class HostKeys(MutableMapping):
 
         entries = []
         for e in self._entries:
+            # CA (@cert-authority) and @revoked entries are not host keys
+            # and must never be handed out as such.
+            if e.marker is not None:
+                continue
             if self._hostname_matches(hostname, e):
                 entries.append(e)
         if len(entries) == 0:
@@ -213,6 +231,9 @@ class HostKeys(MutableMapping):
         :return:
             ``True`` if the key is associated with the hostname; else ``False``
         """
+        # Revoked keys are never acceptable, no matter what else matches.
+        if self.is_revoked(key):
+            return False
         k = self.lookup(hostname)
         if k is None:
             return False
@@ -220,6 +241,120 @@ class HostKeys(MutableMapping):
         if host_key is None:
             return False
         return host_key.asbytes() == key.asbytes()
+
+    def is_revoked(self, key):
+        """
+        Return True if the given key appears in any ``@revoked`` entry.
+
+        Revoked entries apply to all hosts, regardless of the hostnames
+        stored on the entry line (matching OpenSSH behavior).
+
+        :param .PKey key: the key to check
+        :return: ``True`` if the key has been revoked; else ``False``
+
+        .. versionadded:: 4.1
+        """
+        return self._blob_is_revoked(key.asbytes())
+
+    def _blob_is_revoked(self, blob):
+        for e in self._entries:
+            if e.marker == HostKeyEntry.MARKER_REVOKED and e.key is not None:
+                if e.key.asbytes() == blob:
+                    return True
+        return False
+
+    def check_cert(self, hostname, key):
+        """
+        Return True if the given host certificate is valid for the given
+        hostname and was signed by a CA trusted via a ``@cert-authority``
+        entry in this dictionary.
+
+        The certificate's type, validity window, principals, critical
+        options and CA signature are all verified, and ``@revoked`` entries
+        take precedence over any trust anchor. User certificates are never
+        accepted as host certificates.
+
+        :param str hostname: hostname (or IP) of the SSH server, in the same
+            form used for `lookup` (i.e. ``[host]:port`` for nonstandard
+            ports)
+        :param .PKey key: the certificate-bearing key presented by the server
+        :return: ``True`` if the certificate is valid and trusted
+
+        .. versionadded:: 4.1
+        """
+        try:
+            self._verify_host_certificate(hostname, key)
+        except SSHException as e:
+            log = get_logger("paramiko.hostkeys")
+            log.info(
+                "Host certificate rejected for {}: {}".format(hostname, e)
+            )
+            return False
+        return True
+
+    def _verify_host_certificate(self, hostname, key):
+        public_blob = getattr(key, "public_blob", None)
+        if public_blob is None or not public_blob.key_type.endswith(
+            CERT_SUFFIX
+        ):
+            raise SSHException("Key is not an OpenSSH certificate")
+        cert = parse_certificate(public_blob.key_blob)
+        # Revocation trumps everything else: check both the certified key
+        # and the CA key before doing any further work.
+        if self._blob_is_revoked(key.asbytes()):
+            raise SSHException("Certificate's key has been revoked")
+        if self._blob_is_revoked(cert.signature_key):
+            raise SSHException("Certificate's CA key has been revoked")
+        # Only host certificates may authenticate a server; user certs are
+        # not valid here no matter who signed them.
+        if cert.cert_type != CERT_TYPE_HOST:
+            raise SSHException(
+                "Certificate is not a host certificate "
+                "(type {})".format(cert.cert_type)
+            )
+        now = int(time.time())
+        if not (cert.valid_after <= now <= cert.valid_before):
+            raise SSHException(
+                "Certificate is not valid at the current time "
+                "(valid {} to {}, now {})".format(
+                    cert.valid_after, cert.valid_before, now
+                )
+            )
+        # Host certificates must name the host being connected to. Strip
+        # any "[host]:port" wrapper first; principals never carry ports.
+        principal_host = hostname
+        m = re.match(r"^\[(.*)\]:\d+$", hostname)
+        if m is not None:
+            principal_host = m.group(1)
+        if not cert.principals:
+            raise SSHException("Host certificate has no principals")
+        if principal_host not in cert.principals:
+            raise SSHException(
+                "Hostname {!r} is not a principal of the "
+                "certificate".format(principal_host)
+            )
+        # No critical options are defined for host certificates, so any
+        # present option is, by definition, unrecognized.
+        if cert.critical_options:
+            raise SSHException(
+                "Certificate has unrecognized critical options: "
+                + ", ".join(cert.critical_options)
+            )
+        # Finally, the signature must come from a CA we trust for this host.
+        for e in self._entries:
+            if e.marker != HostKeyEntry.MARKER_CA or e.key is None:
+                continue
+            if not self._hostname_matches(hostname, e):
+                continue
+            if e.key.asbytes() != cert.signature_key:
+                continue
+            if e.key.verify_ssh_sig(
+                cert.signed_data, Message(cert.signature)
+            ):
+                return
+        raise SSHException(
+            "Host certificate was not signed by a trusted CA"
+        )
 
     def clear(self):
         """
@@ -314,10 +449,18 @@ class HostKeyEntry:
     Representation of a line in an OpenSSH-style "known hosts" file.
     """
 
-    def __init__(self, hostnames=None, key=None):
+    #: known_hosts marker designating a certificate-authority key
+    MARKER_CA = "@cert-authority"
+    #: known_hosts marker designating a revoked key
+    MARKER_REVOKED = "@revoked"
+    #: all recognized line markers
+    VALID_MARKERS = (MARKER_CA, MARKER_REVOKED)
+
+    def __init__(self, hostnames=None, key=None, marker=None):
         self.valid = (hostnames is not None) and (key is not None)
         self.hostnames = hostnames
         self.key = key
+        self.marker = marker
 
     @classmethod
     def from_line(cls, line, lineno=None):
@@ -327,6 +470,10 @@ class HostKeyEntry:
         format used by the OpenSSH known_hosts file. Fields are separated by a
         single space or tab.
 
+        Lines may begin with a marker such as ``@cert-authority`` (the key
+        is a CA trusted to sign host certificates for the given hosts) or
+        ``@revoked`` (the key must never be accepted).
+
         Lines are expected to not have leading or trailing whitespace.
         We don't bother to check for comments or empty lines.  All of
         that should be taken care of before sending the line to us.
@@ -335,6 +482,15 @@ class HostKeyEntry:
         """
         log = get_logger("paramiko.hostkeys")
         fields = re.split(" |\t", line)
+        marker = None
+        if fields and fields[0].startswith("@"):
+            marker = fields.pop(0)
+            if marker not in cls.VALID_MARKERS:
+                log.info(
+                    "Ignoring known_hosts line {} with unknown "
+                    "marker {!r}".format(lineno, marker)
+                )
+                return None
         if len(fields) < 3:
             # Bad number of fields
             msg = "Not enough fields found in known_hosts in line {} ({!r})"
@@ -357,7 +513,11 @@ class HostKeyEntry:
             raise InvalidHostKey(line, e)
 
         try:
-            return cls(names, PKey.from_type_string(key_type, key_bytes))
+            return cls(
+                names,
+                PKey.from_type_string(key_type, key_bytes),
+                marker=marker,
+            )
         except UnknownKeyType:
             # TODO (backwards incompat): consider changing HostKeys API so this
             # just raises naturally and the exception is muted higher up in the
@@ -372,7 +532,11 @@ class HostKeyEntry:
         included.
         """
         if self.valid:
-            return "{} {} {}\n".format(
+            marker = ""
+            if self.marker is not None:
+                marker = self.marker + " "
+            return "{}{} {} {}\n".format(
+                marker,
                 ",".join(self.hostnames),
                 self.key.get_name(),
                 self.key.get_base64(),
@@ -381,3 +545,143 @@ class HostKeyEntry:
 
     def __repr__(self):
         return "<HostKeyEntry {!r}: {!r}>".format(self.hostnames, self.key)
+
+
+class CertificateInfo:
+    """
+    Parsed contents of an OpenSSH certificate (see PROTOCOL.certkeys).
+
+    Only the fields needed for host certificate verification are exposed.
+
+    .. versionadded:: 4.1
+    """
+
+    def __init__(
+        self,
+        key_type,
+        serial,
+        cert_type,
+        key_id,
+        principals,
+        valid_after,
+        valid_before,
+        critical_options,
+        signature_key,
+        signature,
+        signed_data,
+    ):
+        #: certificate key type, e.g. ``ssh-rsa-cert-v01@openssh.com``
+        self.key_type = key_type
+        #: serial number
+        self.serial = serial
+        #: `CERT_TYPE_USER` or `CERT_TYPE_HOST`
+        self.cert_type = cert_type
+        #: free-form key ID
+        self.key_id = key_id
+        #: list of valid principal names
+        self.principals = principals
+        #: start of validity window (seconds since epoch)
+        self.valid_after = valid_after
+        #: end of validity window (seconds since epoch)
+        self.valid_before = valid_before
+        #: list of critical option names
+        self.critical_options = critical_options
+        #: raw bytes of the signing (CA) public key
+        self.signature_key = signature_key
+        #: raw bytes of the signature field
+        self.signature = signature
+        #: the bytes covered by the signature (everything up to it)
+        self.signed_data = signed_data
+
+
+def _read_string_list(blob):
+    """
+    Parse a packed sequence of SSH strings (as used for certificate
+    principals) into a list of text values.
+    """
+    values = []
+    m = Message(blob)
+    while m.packet.tell() < len(blob):
+        values.append(m.get_text())
+    return values
+
+
+def _read_name_data_pairs(blob):
+    """
+    Parse a packed sequence of name/data string pairs (as used for
+    certificate critical options and extensions), returning the names.
+    """
+    names = []
+    m = Message(blob)
+    while m.packet.tell() < len(blob):
+        names.append(m.get_text())
+        m.get_string()  # option data; not interpreted
+    return names
+
+
+def parse_certificate(blob):
+    """
+    Parse an OpenSSH certificate blob into a `.CertificateInfo`.
+
+    :param bytes blob: the raw certificate (as found in a ``-cert.pub``
+        file's base64 payload or on the wire)
+    :raises: `.SSHException` -- if the blob is not a well-formed certificate
+
+    .. versionadded:: 4.1
+    """
+    try:
+        m = Message(blob)
+        key_type = m.get_text()
+        if not key_type.endswith(CERT_SUFFIX):
+            raise SSHException(
+                "Not an OpenSSH certificate: {!r}".format(key_type)
+            )
+        m.get_string()  # nonce
+        # Skip the certified public key's numbers; how many there are
+        # depends on the key type.
+        base_type = key_type[: -len(CERT_SUFFIX)]
+        if base_type in ("ssh-rsa", "rsa-sha2-256", "rsa-sha2-512"):
+            m.get_mpint()  # e
+            m.get_mpint()  # n
+        elif base_type == "ssh-dss":
+            for _ in range(4):
+                m.get_mpint()  # p, q, g, y
+        elif base_type.startswith("ecdsa-sha2-"):
+            m.get_string()  # curve name
+            m.get_string()  # public point
+        elif base_type == "ssh-ed25519":
+            m.get_string()  # public key
+        else:
+            raise SSHException(
+                "Unsupported certificate key type: {!r}".format(key_type)
+            )
+        serial = m.get_int64()
+        cert_type = m.get_int()
+        key_id = m.get_text()
+        principals = _read_string_list(m.get_string())
+        valid_after = m.get_int64()
+        valid_before = m.get_int64()
+        critical_options = _read_name_data_pairs(m.get_string())
+        m.get_string()  # extensions; none are defined for host certs
+        m.get_string()  # reserved
+        signature_key = m.get_string()
+        # The signature covers everything up to (not including) itself.
+        signed_data = blob[: m.packet.tell()]
+        signature = m.get_string()
+    except SSHException:
+        raise
+    except (struct.error, IndexError, UnicodeDecodeError) as e:
+        raise SSHException("Unparseable certificate: {}".format(e))
+    return CertificateInfo(
+        key_type=key_type,
+        serial=serial,
+        cert_type=cert_type,
+        key_id=key_id,
+        principals=principals,
+        valid_after=valid_after,
+        valid_before=valid_before,
+        critical_options=critical_options,
+        signature_key=signature_key,
+        signature=signature,
+        signed_data=signed_data,
+    )

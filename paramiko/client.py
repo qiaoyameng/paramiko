@@ -443,7 +443,25 @@ class SSHClient(ClosingContextManager):
         t.start_client(timeout=timeout)
 
         server_key = t.get_remote_server_key()
-        if our_server_keys is None:
+        server_public_blob = getattr(server_key, "public_blob", None)
+        server_is_cert = server_public_blob is not None and (
+            server_public_blob.key_type.endswith("-cert-v01@openssh.com")
+        )
+        if server_is_cert:
+            # Host certificates are not matched key-for-key; they are
+            # verified against @cert-authority CA entries (with @revoked
+            # entries taking precedence) in the system and local host keys.
+            if not (
+                self._system_host_keys.check_cert(
+                    server_hostkey_name, server_key
+                )
+                or self._host_keys.check_cert(server_hostkey_name, server_key)
+            ):
+                raise SSHException(
+                    "Host certificate verification failed for "
+                    "{}".format(server_hostkey_name)
+                )
+        elif our_server_keys is None:
             # will raise exception if the key is rejected
             self._policy.missing_host_key(
                 self, server_hostkey_name, server_key
