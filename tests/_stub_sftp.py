@@ -21,6 +21,7 @@ A stub SFTP server for loopback SFTP testing.
 """
 
 import os
+import threading
 
 from paramiko import (
     AUTH_SUCCESSFUL,
@@ -230,3 +231,55 @@ class StubSFTPServer(SFTPServerInterface):
             else:
                 symlink = "<error>"
         return symlink
+
+
+class ConditionalStubSFTPServer(StubSFTPServer):
+    """
+    Reference local-filesystem implementation of the
+    ``conditional-write@paramiko`` extension.
+
+    Version tokens are derived from the file's ``os.stat`` result (inode,
+    size and mtime in nanoseconds), so they change whenever the file is
+    replaced.  Commits serialize the version check and the atomic
+    ``os.replace`` under a lock shared by all sessions of this server
+    class, so concurrent clients can't slip between another client's
+    check and its rename.
+    """
+
+    # shared by all sessions (each channel gets its own instance of this
+    # class, so the lock must live on the class, not the instance)
+    _commit_lock = threading.Lock()
+
+    @staticmethod
+    def _version_of(path):
+        try:
+            st = os.stat(path)
+        except OSError:
+            # missing files are represented by the empty token
+            return ""
+        return "{:x}-{:x}-{:x}".format(
+            st.st_ino, st.st_size, st.st_mtime_ns
+        )
+
+    def conditional_version(self, path):
+        return self._version_of(self._realpath(path))
+
+    def conditional_commit(self, tmp_path, target_path, expected_version):
+        tmp_path = self._realpath(tmp_path)
+        target_path = self._realpath(target_path)
+        with self._commit_lock:
+            current = self._version_of(target_path)
+            if current != expected_version:
+                return (
+                    SFTP_FAILURE,
+                    "Version conflict: expected {}, current is {}".format(
+                        expected_version or "<none>", current or "<none>"
+                    ),
+                )
+            try:
+                # atomic within the same filesystem; readers of the target
+                # only ever see the old or the new complete file
+                os.replace(tmp_path, target_path)
+            except OSError as e:
+                return SFTPServer.convert_errno(e.errno)
+            return self._version_of(target_path)

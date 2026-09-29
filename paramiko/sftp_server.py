@@ -60,6 +60,7 @@ from paramiko.sftp import (
     SFTP_BAD_MESSAGE,
     SFTP_DESC,
     SFTP_EOF,
+    EXT_CONDITIONAL_WRITE,
     SFTP_FAILURE,
     SFTP_FLAG_APPEND,
     SFTP_FLAG_CREATE,
@@ -170,6 +171,20 @@ class SFTPServer(BaseSFTP, SubsystemHandler):
             f.close()
         self.file_table = {}
         self.folder_table = {}
+
+    def _get_extension_pairs(self):
+        pairs = super()._get_extension_pairs()
+        si = type(self.server)
+        # only advertise the conditional-write extension if the server
+        # interface actually implements both halves of it
+        if (
+            si.conditional_version
+            is not SFTPServerInterface.conditional_version
+            and si.conditional_commit
+            is not SFTPServerInterface.conditional_commit
+        ):
+            pairs += [EXT_CONDITIONAL_WRITE, "1"]
+        return pairs
 
     @staticmethod
     def convert_errno(e):
@@ -374,6 +389,34 @@ class SFTPServer(BaseSFTP, SubsystemHandler):
             flags |= os.O_EXCL
         return flags
 
+    def _conditional_write(self, request_number, msg):
+        # handler for the "conditional-write@paramiko" extension: fetch a
+        # file's version token, or atomically check-and-replace a file.
+        subcommand = msg.get_text()
+        if subcommand == "version":
+            path = msg.get_text()
+            resp = self.server.conditional_version(path)
+            if isinstance(resp, str):
+                self._response(request_number, CMD_EXTENDED_REPLY, resp)
+            else:
+                self._send_status(request_number, resp)
+        elif subcommand == "commit":
+            tmp_path = msg.get_text()
+            target_path = msg.get_text()
+            expected_version = msg.get_text()
+            resp = self.server.conditional_commit(
+                tmp_path, target_path, expected_version
+            )
+            if isinstance(resp, str):
+                # success: report the new version token
+                self._response(request_number, CMD_EXTENDED_REPLY, resp)
+            elif isinstance(resp, tuple):
+                self._send_status(request_number, resp[0], resp[1])
+            else:
+                self._send_status(request_number, resp)
+        else:
+            self._send_status(request_number, SFTP_OP_UNSUPPORTED)
+
     def _process(self, t, request_number, msg):
         self._log(DEBUG, "Request: {}".format(CMD_NAMES[t]))
         if t == CMD_OPEN:
@@ -529,6 +572,8 @@ class SFTPServer(BaseSFTP, SubsystemHandler):
                 self._send_status(
                     request_number, self.server.posix_rename(oldpath, newpath)
                 )
+            elif tag == EXT_CONDITIONAL_WRITE:
+                self._conditional_write(request_number, msg)
             else:
                 self._send_status(request_number, SFTP_OP_UNSUPPORTED)
         else:

@@ -314,3 +314,54 @@ class SFTPServerInterface:
         :return: an error code `int` like ``SFTP_OK``.
         """
         return SFTP_OP_UNSUPPORTED
+
+    def conditional_version(self, path):
+        """
+        Return the current version token of the file at ``path``, for the
+        ``conditional-write@paramiko`` extension.
+
+        The token is an opaque, server-generated string which must change
+        whenever the file's content is replaced.  Return ``""`` if the file
+        does not exist.
+
+        The default implementation returns ``SFTP_OP_UNSUPPORTED``; override
+        it (together with `conditional_commit`) to support conditional
+        writes.  The extension is only advertised to clients when both
+        methods are overridden.
+
+        :param str path: the requested path of the file.
+        :return:
+            a version token `str`, or an SFTP error code `int` like
+            ``SFTP_PERMISSION_DENIED``.
+        """
+        return SFTP_OP_UNSUPPORTED
+
+    def conditional_commit(self, tmp_path, target_path, expected_version):
+        """
+        Atomically replace the file at ``target_path`` with the (already
+        uploaded) temporary file at ``tmp_path``, but only if the target's
+        current version token equals ``expected_version``.
+
+        The version check and the replacement must happen as one atomic
+        step (e.g. under a lock shared by all sessions, using a rename
+        within the same filesystem), so that concurrent clients cannot
+        silently overwrite each other and readers never see a partially
+        written target file.
+
+        The default implementation returns ``SFTP_OP_UNSUPPORTED``; override
+        it (together with `conditional_version`) to support conditional
+        writes.
+
+        :param str tmp_path: path of the uploaded temporary file.
+        :param str target_path: path of the file to replace.
+        :param str expected_version:
+            version token the target must still have (``""`` means the
+            target must not exist).
+        :return:
+            the new version token `str` of the replaced file on success;
+            an SFTP error code `int` on failure; or a ``(code, message)``
+            tuple to send a custom error description (the reference
+            implementation reports version mismatches as
+            ``(SFTP_FAILURE, "Version conflict: ...")``).
+        """
+        return SFTP_OP_UNSUPPORTED

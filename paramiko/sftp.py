@@ -83,6 +83,12 @@ SFTP_FLAG_EXCL = 0x20
 
 _VERSION = 3
 
+# name of the optional conditional-write extension.  servers that support it
+# advertise it in the version handshake; clients may then ask for the current
+# version token of a remote file and commit a replacement only if the version
+# is unchanged (atomic compare-and-replace).
+EXT_CONDITIONAL_WRITE = "conditional-write@paramiko"
+
 
 # for debugging
 CMD_NAMES = {
@@ -135,6 +141,9 @@ class BaseSFTP:
         self.logger = util.get_logger("paramiko.sftp")
         self.sock = None
         self.ultra_debug = False
+        # extensions advertised by the server in the version handshake,
+        # as a dict of extension-name -> extension-data
+        self.server_extensions = {}
 
     # ...internals...
 
@@ -145,10 +154,21 @@ class BaseSFTP:
         t, data = self._read_packet()
         if t != CMD_VERSION:
             raise SFTPError("Incompatible sftp protocol")
-        version = struct.unpack(">I", data[:4])[0]
+        msg = Message(data)
+        version = msg.get_int()
+        # collect any extension name/data pairs the server sent
+        while len(msg.get_remainder()) > 0:
+            ext_name = msg.get_text()
+            ext_data = msg.get_text()
+            self.server_extensions[ext_name] = ext_data
         #        if version != _VERSION:
         #            raise SFTPError('Incompatible sftp protocol')
         return version
+
+    def _get_extension_pairs(self):
+        # extensions to advertise to the client, as a flat list of
+        # (name, data) strings
+        return ["check-file", "md5,sha1"]
 
     def _send_server_version(self):
         # winscp will freak out if the server sends version info before the
@@ -157,11 +177,9 @@ class BaseSFTP:
         if t != CMD_INIT:
             raise SFTPError("Incompatible sftp protocol")
         version = struct.unpack(">I", data[:4])[0]
-        # advertise that we support "check-file"
-        extension_pairs = ["check-file", "md5,sha1"]
         msg = Message()
         msg.add_int(_VERSION)
-        msg.add(*extension_pairs)
+        msg.add(*self._get_extension_pairs())
         self._send_packet(CMD_VERSION, msg)
         return version
 

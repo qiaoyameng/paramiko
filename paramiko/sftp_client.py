@@ -23,6 +23,7 @@ import os
 import stat
 import threading
 import time
+import uuid
 import weakref
 from paramiko import util
 from paramiko.channel import Channel
@@ -56,6 +57,8 @@ from paramiko.sftp import (
     CMD_REALPATH,
     CMD_STATUS,
     CMD_EXTENDED,
+    CMD_EXTENDED_REPLY,
+    EXT_CONDITIONAL_WRITE,
     SFTP_OK,
     SFTP_EOF,
     SFTP_NO_SUCH_FILE,
@@ -85,6 +88,29 @@ def _to_unicode(s):
 
 
 b_slash = b"/"
+
+
+class ConditionalWriteUnsupported(SSHException):
+    """
+    Raised when a conditional write is requested but the server does not
+    support the ``conditional-write@paramiko`` extension.
+
+    Conditional mode is refused outright in this case: falling back to a
+    non-atomic "stat then rename" sequence would silently lose the
+    atomicity guarantee, so it is never attempted.
+    """
+
+    pass
+
+
+class VersionConflictError(IOError):
+    """
+    Raised when a conditional write commit fails because the remote file's
+    version no longer matches the version token supplied by the caller
+    (i.e. someone else modified the file in the meantime).
+    """
+
+    pass
 
 
 class SFTPClient(BaseSFTP, ClosingContextManager):
@@ -757,6 +783,146 @@ class SFTPClient(BaseSFTP, ClosingContextManager):
         file_size = os.stat(localpath).st_size
         with open(localpath, "rb") as fl:
             return self.putfo(fl, remotepath, file_size, callback, confirm)
+
+    def supports_conditional_write(self):
+        """
+        Check whether the server supports atomic conditional writes via the
+        ``conditional-write@paramiko`` extension (see `put_conditional`).
+
+        :return: `True` if the server advertised the extension during the
+            SFTP handshake.
+        """
+        return EXT_CONDITIONAL_WRITE in self.server_extensions
+
+    def _require_conditional_write(self):
+        if not self.supports_conditional_write():
+            raise ConditionalWriteUnsupported(
+                "server does not support the {!r} extension; "
+                "refusing conditional write (no stat/rename fallback "
+                "is attempted)".format(EXT_CONDITIONAL_WRITE)
+            )
+
+    def get_remote_version(self, remotepath):
+        """
+        Fetch the server's current version token for a remote file.
+
+        The token is an opaque, server-generated string which changes
+        whenever the file is replaced.  An empty string means the file does
+        not exist (yet).  Pass the token to `put_conditional` to make sure
+        the file has not changed since it was read.
+
+        Requires server support for the ``conditional-write@paramiko``
+        extension.
+
+        :param str remotepath: path of the remote file
+        :return: the current version token (`str`, possibly empty)
+
+        :raises:
+            `.ConditionalWriteUnsupported` -- if the server does not support
+            the conditional-write extension
+        """
+        self._require_conditional_write()
+        remotepath = self._adjust_cwd(remotepath)
+        self._log(DEBUG, "get_remote_version({!r})".format(remotepath))
+        t, msg = self._request(
+            CMD_EXTENDED, EXT_CONDITIONAL_WRITE, "version", remotepath
+        )
+        if t != CMD_EXTENDED_REPLY:
+            raise SFTPError(
+                "Server gave unexpected reply to version request"
+            )
+        return msg.get_text()
+
+    def put_conditional(
+        self, localpath, remotepath, expected_version, callback=None
+    ):
+        """
+        Atomically replace a remote file, but only if its current version
+        still matches ``expected_version`` (a token previously obtained from
+        `get_remote_version`).  An empty ``expected_version`` requires the
+        target file to not exist yet.
+
+        The new content is first uploaded to a unique temporary file next to
+        the target, then committed via the ``conditional-write@paramiko``
+        extension, which checks the version and renames the temporary file
+        over the target as one atomic step on the server.  The target
+        therefore always holds a complete file -- readers never observe a
+        partially written one.
+
+        If anything fails, only this client's own temporary file is removed;
+        the target and other clients' files are never touched.
+
+        :param str localpath: the local file to copy
+        :param str remotepath: the destination path on the SFTP server
+        :param str expected_version:
+            version token the remote file must still have for the commit to
+            succeed (``""`` means "must not exist")
+        :param callable callback:
+            optional callback function (form: ``func(int, int)``) that
+            accepts the bytes transferred so far and the total bytes to be
+            transferred
+
+        :return: the new version token (`str`) of the replaced remote file
+
+        :raises:
+            `.ConditionalWriteUnsupported` -- if the server does not support
+            the conditional-write extension; conditional mode is refused
+            rather than emulated with a racy stat/rename sequence
+        :raises:
+            `.VersionConflictError` -- if the remote file's version no
+            longer matches ``expected_version``
+        """
+        self._require_conditional_write()
+        remotepath = self._adjust_cwd(remotepath)
+        # unique temporary name next to the target (same folder, so the
+        # server-side commit can atomically rename within one filesystem)
+        tmp_remotepath = b(remotepath) + b(
+            ".condwrite-{}.tmp".format(uuid.uuid4().hex)
+        )
+        self._log(
+            DEBUG,
+            "put_conditional({!r}, {!r}, {!r}) via {!r}".format(
+                localpath, remotepath, expected_version, tmp_remotepath
+            ),
+        )
+        committed = False
+        try:
+            self.put(localpath, tmp_remotepath, callback)
+            new_version = self._conditional_commit(
+                tmp_remotepath, remotepath, expected_version
+            )
+            committed = True
+            return new_version
+        finally:
+            if not committed:
+                # clean up only our own temporary file; ignore errors (it
+                # may not exist yet, or the server may already be gone)
+                try:
+                    self.remove(tmp_remotepath)
+                except IOError:
+                    pass
+
+    def _conditional_commit(self, tmp_remotepath, remotepath, expect_version):
+        try:
+            t, msg = self._request(
+                CMD_EXTENDED,
+                EXT_CONDITIONAL_WRITE,
+                "commit",
+                tmp_remotepath,
+                remotepath,
+                expect_version,
+            )
+        except IOError as e:
+            # the reference server reports a version mismatch as an
+            # SFTP_FAILURE whose description starts with "Version conflict"
+            if e.args and isinstance(e.args[0], str) and e.args[0].startswith(
+                "Version conflict"
+            ):
+                raise VersionConflictError(str(e)) from None
+            raise
+        if t != CMD_EXTENDED_REPLY:
+            raise SFTPError("Server gave unexpected reply to commit request")
+        return msg.get_text()
 
     def getfo(
         self,
