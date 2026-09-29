@@ -1,0 +1,6 @@
+Host app-01
+    ControlPath ~/.ssh/cm-%n-%h.sock
+    IdentityFile ~/.ssh/grandchild_id
+
+Host app-*
+    IdentityFile ~/.ssh/star_id

@@ -1,7 +1,7 @@
 # This file is part of Paramiko and subject to the license in /LICENSE in this
 # repository
 
-from os.path import expanduser
+from os.path import expanduser, realpath
 from socket import gaierror
 
 try:
@@ -1046,3 +1046,170 @@ class TestFinalMatching(object):
     def test_negated(self):
         result = load_config("match-final").lookup("jump")
         assert result["port"] == "1003"
+
+
+class TestInclude:
+    def test_nested_includes_are_expanded_inline(self):
+        # include-main includes include-child, which includes
+        # include-grandchild; values from all three are visible.
+        result = load_config("include-main").lookup("app-01")
+        assert result["hostname"] == "app-01.internal.example.com"
+        assert result["user"] == "appuser"
+        assert result["port"] == "2201"
+
+    def test_relative_include_resolves_against_including_file(self):
+        # include-child lives next to include-main and says plain
+        # 'Include include-grandchild' (no directory component).
+        result = load_config("include-main").lookup("app-01")
+        assert result["identityfile"] == [
+            expanduser("~/.ssh/app-01.internal.example.com_id"),
+            expanduser("~/.ssh/grandchild_id"),
+            expanduser("~/.ssh/star_id"),
+        ]
+
+    def test_include_cycle_raises_with_chain(self):
+        with raises(ConfigParseError) as info:
+            load_config("include-cycle-a")
+        message = str(info.value)
+        cycle_a, cycle_b = (
+            realpath(_config("include-cycle-a")),
+            realpath(_config("include-cycle-b")),
+        )
+        assert "Include cycle detected" in message
+        assert cycle_a in message
+        assert cycle_b in message
+        # The chain closes the loop: a -> b -> a
+        assert message.count(cycle_a) == 2
+
+    def test_self_include_is_a_cycle(self):
+        with raises(ConfigParseError) as info:
+            load_config("include-self")
+        assert "Include cycle detected" in str(info.value)
+
+    def test_unmatched_include_globs_are_ignored(self):
+        config = SSHConfig.from_text(
+            "Include /definitely-not-a-real-dir-xyz/*\nUser foo"
+        )
+        assert config.lookup("somehost")["user"] == "foo"
+
+
+class TestExplain:
+    def setup_method(self):
+        self.config = load_config("include-main")
+
+    def explained(self, host):
+        explained = self.config.explain(host)
+        return {key: val.value for key, val in explained.items()}
+
+    @mark.parametrize("host", ["app-01", "app-02", "other"])
+    def test_final_values_match_lookup_exactly(self, host):
+        assert self.explained(host) == self.config.lookup(host)
+
+    def test_reports_deciding_file_line_and_condition(self):
+        explained = self.config.explain("app-01")
+        user = explained["user"]
+        assert user.value == "appuser"
+        assert user.source.file == _config("include-child")
+        assert user.source.line == 2
+        assert user.source.condition == "Host app-* !app-02"
+
+    def test_first_obtained_value_wins(self):
+        # Both 'Host app-01' (port 2201, earlier) and 'Host *' (port 22)
+        # match; the first obtained value wins and is the one explained.
+        explained = self.config.explain("app-01")
+        port = explained["port"]
+        assert port.value == "2201"
+        assert port.source.file == _config("include-main")
+        assert port.source.line == 3
+        assert port.source.condition == "Host app-01"
+        assert len(port.sources) == 1
+
+    def test_raw_value_is_pre_expansion(self):
+        explained = self.config.explain("app-01")
+        hostname = explained["hostname"]
+        assert hostname.value == "app-01.internal.example.com"
+        assert hostname.raw_value == "%h.internal.example.com"
+        controlpath = explained["controlpath"]
+        assert controlpath.raw_value == "~/.ssh/cm-%n-%h.sock"
+        # NOTE: ControlPath expands %n/%h but not ~ (per OpenSSH's rules)
+        assert controlpath.value == (
+            "~/.ssh/cm-app-01-app-01.internal.example.com.sock"
+        )
+
+    def test_negated_host_patterns_attribute_correctly(self):
+        # app-02 is excluded from 'Host app-* !app-02', so its User comes
+        # from the later 'Host *' stanza instead.
+        explained = self.config.explain("app-02")
+        user = explained["user"]
+        assert user.value == "default"
+        assert user.source.file == _config("include-main")
+        assert user.source.condition == "Host *"
+
+    def test_list_option_appends_are_tracked(self):
+        explained = self.config.explain("app-01")
+        identityfile = explained["identityfile"]
+        assert identityfile.value == [
+            expanduser("~/.ssh/app-01.internal.example.com_id"),
+            expanduser("~/.ssh/grandchild_id"),
+            expanduser("~/.ssh/star_id"),
+        ]
+        assert identityfile.raw_value == [
+            "~/.ssh/%h_id",
+            "~/.ssh/grandchild_id",
+            "~/.ssh/star_id",
+        ]
+        assert [s.file for s in identityfile.sources] == [
+            _config("include-child"),
+            _config("include-grandchild"),
+            _config("include-grandchild"),
+        ]
+        assert [s.line for s in identityfile.sources] == [3, 3, 6]
+        assert [s.condition for s in identityfile.sources] == [
+            "Host app-* !app-02",
+            "Host app-01",
+            "Host app-*",
+        ]
+
+    def test_implicit_hostname_has_implicit_source(self):
+        # No HostName was configured for app-02, so the looked-up hostname
+        # itself is used, with no file/line/condition to point at.
+        explained = self.config.explain("app-02")
+        hostname = explained["hostname"]
+        assert hostname.value == "app-02"
+        assert hostname.source.file is None
+        assert hostname.source.line is None
+        assert hostname.source.condition is None
+
+    def test_implicit_global_stanza_has_none_condition(self):
+        config = SSHConfig.from_text("User globaluser")
+        explained = config.explain("whatever")
+        assert explained["user"].value == "globaluser"
+        assert explained["user"].source.condition is None
+
+    def test_canonicalized_lookup_matches_explain(self, socket):
+        config = load_config("canon")
+        explained = config.explain("www")
+        final = {key: val.value for key, val in explained.items()}
+        assert final == config.lookup("www")
+        # HostName came from canonicalization, not from any config line
+        assert explained["hostname"].value == "www.paramiko.org"
+        assert explained["hostname"].source.file is None
+        # ...but User did come from a line, in the canonicalized Host stanza
+        assert explained["user"].source.condition == "Host www.paramiko.org"
+
+    @mark.skipif(Result is None, reason="requires invoke package")
+    @patch("paramiko.config.invoke.run")
+    def test_match_exec_is_not_run_extra_times(self, run):
+        run.side_effect = _expect("quoted")
+        config = load_config("match-exec")
+        result = config.lookup("whatever")
+        assert result["user"] == "benjamin"
+        lookup_calls = run.call_count
+        assert lookup_calls > 0
+        run.reset_mock()
+        explained = config.explain("whatever")
+        # Same number of exec executions as lookup - provenance gathering
+        # must not re-evaluate any Match exec.
+        assert run.call_count == lookup_calls
+        assert explained["user"].value == "benjamin"
+        assert explained["user"].source.condition == 'Match exec "quoted"'

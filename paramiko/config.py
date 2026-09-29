@@ -23,6 +23,7 @@ Configuration file (aka ``ssh_config``) support.
 
 import fnmatch
 import getpass
+import glob
 import os
 import re
 import shlex
@@ -88,6 +89,8 @@ class SSHConfig:
             config = SSHConfig.from_text("Host foo\\n\\tUser bar")
         """
         self._config = []
+        # Provenance records parallel to ``self._config``; see `explain`.
+        self._sources = []
 
     @classmethod
     def from_text(cls, text):
@@ -124,11 +127,43 @@ class SSHConfig:
         Read an OpenSSH config from the given file object.
 
         :param file_obj: a file-like object to read the config file from
+
+        .. versionchanged:: 3.5
+            Added ``Include`` support, and source tracking (file, line
+            number and matching condition) for use by `explain`.
         """
         # Start out w/ implicit/anonymous global host-like block to hold
         # anything not contained by an explicit one.
+        source = getattr(file_obj, "name", None) or "<string>"
         context = {"host": ["*"], "config": {}}
-        for line in file_obj:
+        contexts = [context]
+        # Provenance is tracked in a structure parallel to ``contexts`` (and
+        # later, ``self._config``) so that the shape of the parsed config
+        # itself remains unchanged.
+        sources = [{"condition": None, "keys": {}}]
+        # Seed the include chain with ourselves, so a file including itself
+        # (directly or transitively) is detected as a cycle.
+        chain = []
+        if not source.startswith("<") and os.path.exists(source):
+            chain.append(os.path.realpath(source))
+        self._parse_lines(file_obj, source, contexts, sources, chain)
+        self._config.extend(contexts)
+        self._sources.extend(sources)
+
+    def _parse_lines(self, lines, source, contexts, sources, include_chain):
+        """
+        Parse config ``lines`` (an iterable of text lines) into ``contexts``.
+
+        ``contexts`` is a mutable list of stanza dicts; its last element is
+        the currently-open stanza. ``sources`` is a parallel list of
+        provenance dicts (one per stanza, each holding the stanza's
+        ``condition`` text and a ``keys`` map of config key to
+        `ConfigSource` lists). ``source`` is the file name (or a
+        placeholder) used for provenance tracking, and ``include_chain``
+        is the stack of real paths of files currently being parsed, used
+        for ``Include`` cycle detection.
+        """
+        for lineno, line in enumerate(lines, 1):
             # Strip any leading or trailing whitespace from the line.
             # Refer to https://github.com/paramiko/paramiko/issues/499
             line = line.strip()
@@ -143,10 +178,13 @@ class SSHConfig:
             key = match.group(1).lower()
             value = match.group(2)
 
+            context = contexts[-1]
+            provenance = sources[-1]
             # Host keyword triggers switch to new block/context
             if key in ("host", "match"):
-                self._config.append(context)
                 context = {"config": {}}
+                # Remember the exact directive for later explanation.
+                provenance = {"condition": line, "keys": {}}
                 if key == "host":
                     # TODO (backwards incompat): make these real objects or at
                     # least name this "hosts" to acknowledge it's an iterable.
@@ -156,28 +194,82 @@ class SSHConfig:
                     context["host"] = self._get_hosts(value)
                 else:
                     context["matches"] = self._get_matches(value)
+                contexts.append(context)
+                sources.append(provenance)
+            # Include directives are expanded inline, as if the included
+            # file's contents appeared at this point (OpenSSH semantics).
+            elif key == "include":
+                self._parse_include(
+                    value, source, contexts, sources, include_chain
+                )
             # Special-case for noop ProxyCommands
             elif key == "proxycommand" and value.lower() == "none":
                 # Store 'none' as None - not as a string implying that the
                 # proxycommand is the literal shell command "none"!
                 context["config"][key] = None
+                provenance["keys"][key] = [
+                    ConfigSource(
+                        source, lineno, provenance["condition"], None
+                    )
+                ]
             # All other keywords get stored, directly or via append
             else:
                 if value.startswith('"') and value.endswith('"'):
                     value = value[1:-1]
 
+                record = ConfigSource(
+                    source, lineno, provenance["condition"], value
+                )
                 # identityfile, localforward, remoteforward keys are special
                 # cases, since they are allowed to be specified multiple times
                 # and they should be tried in order of specification.
                 if key in ["identityfile", "localforward", "remoteforward"]:
                     if key in context["config"]:
                         context["config"][key].append(value)
+                        provenance["keys"][key].append(record)
                     else:
                         context["config"][key] = [value]
+                        provenance["keys"][key] = [record]
                 elif key not in context["config"]:
                     context["config"][key] = value
-        # Store last 'open' block and we're done
-        self._config.append(context)
+                    provenance["keys"][key] = [record]
+
+    def _parse_include(self, value, source, contexts, sources, include_chain):
+        """
+        Handle an ``Include`` directive encountered while parsing.
+
+        Resolves the (possibly globbed, possibly relative) patterns in
+        ``value`` and parses each matching file inline, recursing for nested
+        includes. Relative paths are resolved against the directory of the
+        file containing the directive. Raises `ConfigParseError` (with the
+        full include chain) when a cycle is detected.
+        """
+        try:
+            patterns = shlex.split(value)
+        except ValueError:
+            raise ConfigParseError("Unparsable Include {}".format(value))
+        base = ""
+        if source and not source.startswith("<"):
+            base = os.path.dirname(os.path.abspath(source))
+        for pattern in patterns:
+            pattern = os.path.expanduser(pattern)
+            if not os.path.isabs(pattern):
+                pattern = os.path.join(base or os.curdir, pattern)
+            # OpenSSH silently ignores patterns matching nothing; so do we.
+            for path in sorted(glob.glob(pattern)):
+                real = os.path.realpath(path)
+                if real in include_chain:
+                    chain = include_chain + [real]
+                    raise ConfigParseError(
+                        "Include cycle detected: {}".format(
+                            " -> ".join(chain)
+                        )
+                    )
+                with open(path) as flo:
+                    self._parse_lines(
+                        flo, path, contexts, sources,
+                        include_chain + [real],
+                    )
 
     def lookup(self, hostname):
         """
@@ -220,12 +312,73 @@ class SSHConfig:
         .. versionchanged:: 3.3
             Added ``Match final`` support.
         """
+        return self._lookup_impl(hostname)
+
+    def explain(self, hostname):
+        """
+        Like `lookup`, but also explain where each setting came from.
+
+        Returns a dict mapping each config key to an `ExplainedValue`, which
+        pairs the final (expanded) value -- identical to what `lookup`
+        returns -- with a list of `ConfigSource` provenance records. Each
+        record notes the file, line number, matching condition (the
+        ``Host``/``Match`` directive of the enclosing stanza, or ``None``
+        for global/implied settings) and the raw, pre-expansion value
+        responsible for the final value.
+
+        List-valued options such as ``IdentityFile`` accumulate one
+        `ConfigSource` per appended line, in order, so their append
+        behavior is fully traceable.
+
+        The explanation is collected during the exact same lookup passes
+        `lookup` performs -- no config lines are re-evaluated, and in
+        particular ``Match exec`` commands are not executed any extra
+        times.
+
+        For example::
+
+            explained = my_config.explain("web-01")
+            assert explained["user"].value == "alice"
+            assert explained["user"].source.file == "/home/me/.ssh/config"
+            assert explained["user"].source.line == 12
+            assert explained["user"].source.condition == "Host web-*"
+            # Reconstruct the same dict lookup() would give:
+            assert {
+                k: v.value for k, v in explained.items()
+            } == my_config.lookup("web-01")
+
+        :param str hostname: the hostname to explain
+
+        .. versionadded:: 3.5
+        """
+        sources = {}
+        options = self._lookup_impl(hostname, explain=sources)
+        return {
+            key: ExplainedValue(
+                key=key, value=value, sources=sources.get(key, [])
+            )
+            for key, value in options.items()
+        }
+
+    def _lookup_impl(self, hostname, explain=None):
+        """
+        Shared implementation of `lookup` and `explain`.
+
+        When ``explain`` is a dict, it is populated (keyed by config key)
+        with lists of `ConfigSource` records as values are decided, so that
+        provenance gathering does not require any additional evaluation
+        passes (and thus no additional ``Match exec`` executions).
+        """
         # First pass
-        options = self._lookup(hostname=hostname)
+        options = self._lookup(hostname=hostname, explain=explain)
         # Inject HostName if it was not set (this used to be done incidentally
         # during tokenization, for some reason).
         if "hostname" not in options:
             options["hostname"] = hostname
+            if explain is not None:
+                explain["hostname"] = [
+                    ConfigSource(None, None, None, hostname)
+                ]
         # Handle canonicalization
         canon = options.get("canonicalizehostname", None) in ("yes", "always")
         maxdots = int(options.get("canonicalizemaxdots", 1))
@@ -236,22 +389,31 @@ class SSHConfig:
             hostname = self.canonicalize(hostname, options, domains)
             # Overwrite HostName again here (this is also what OpenSSH does)
             options["hostname"] = hostname
+            if explain is not None:
+                explain.setdefault("hostname", []).append(
+                    ConfigSource(None, None, None, hostname)
+                )
             options = self._lookup(
-                hostname, options, canonical=True, final=True
+                hostname, options, canonical=True, final=True,
+                explain=explain,
             )
         else:
             options = self._lookup(
-                hostname, options, canonical=False, final=True
+                hostname, options, canonical=False, final=True,
+                explain=explain,
             )
         return options
 
-    def _lookup(self, hostname, options=None, canonical=False, final=False):
+    def _lookup(
+        self, hostname, options=None, canonical=False, final=False,
+        explain=None,
+    ):
         # Init
         if options is None:
             options = SSHConfigDict()
         # Iterate all stanzas, applying any that match, in turn (so that things
         # like Match can reference currently understood state)
-        for context in self._config:
+        for index, context in enumerate(self._config):
             if not (
                 self._pattern_matches(context.get("host", []), hostname)
                 or self._does_match(
@@ -263,6 +425,10 @@ class SSHConfig:
                 )
             ):
                 continue
+            if explain is not None and index < len(self._sources):
+                provenance = self._sources[index]["keys"]
+            else:
+                provenance = {}
             for key, value in context["config"].items():
                 if key not in options:
                     # Create a copy of the original value,
@@ -270,10 +436,18 @@ class SSHConfig:
                     # in self._config and update that value too
                     # when the extend() is being called.
                     options[key] = value[:] if value is not None else value
+                    if explain is not None:
+                        explain[key] = list(provenance.get(key, []))
                 elif key == "identityfile":
-                    options[key].extend(
-                        x for x in value if x not in options[key]
-                    )
+                    records = provenance.get(key, [])
+                    for offset, item in enumerate(value):
+                        if item in options[key]:
+                            continue
+                        options[key].append(item)
+                        if explain is not None and offset < len(records):
+                            explain.setdefault(key, []).append(
+                                records[offset]
+                            )
         if final:
             # Expand variables in resulting values
             # (besides 'Match exec' which was already handled above)
@@ -629,6 +803,112 @@ class LazyFqdn:
             # Cache
             self.fqdn = fqdn
         return self.fqdn
+
+
+class ConfigSource:
+    """
+    Provenance record for a single line of an SSH config file.
+
+    Instances of this class are attached to the `ExplainedValue` results of
+    `SSHConfig.explain`, and describe one config line that contributed to a
+    looked-up value:
+
+    - ``file``: path of the file the line was read from (``None`` for
+      implied/default values not read from any file).
+    - ``line``: 1-based line number within that file (``None`` for implied
+      values).
+    - ``condition``: the text of the ``Host``/``Match`` directive opening
+      the stanza the line belongs to (``None`` for lines in the implicit
+      global stanza or for implied values).
+    - ``value``: the raw value as written in the file, before any ``%h``
+      style token expansion.
+
+    .. versionadded:: 3.5
+    """
+
+    def __init__(self, file, line, condition, value):
+        self.file = file
+        self.line = line
+        self.condition = condition
+        self.value = value
+
+    def __repr__(self):
+        if self.file is None:
+            location = "<implicit>"
+        else:
+            location = "{}:{}".format(self.file, self.line)
+        return "<{} {} {!r}>".format(
+            self.__class__.__name__, location, self.value
+        )
+
+    def __eq__(self, other):
+        if not isinstance(other, ConfigSource):
+            return NotImplemented
+        mine = (self.file, self.line, self.condition, self.value)
+        theirs = (other.file, other.line, other.condition, other.value)
+        return mine == theirs
+
+    def __ne__(self, other):
+        result = self.__eq__(other)
+        if result is NotImplemented:
+            return result
+        return not result
+
+
+class ExplainedValue:
+    """
+    A single config value, paired with an explanation of where it came from.
+
+    These are the values of the dict returned by `SSHConfig.explain`:
+
+    - ``key``: the (lowercased) config keyword.
+    - ``value``: the final value, exactly as `SSHConfig.lookup` would
+      return it (i.e. with substitution tokens expanded).
+    - ``sources``: list of `ConfigSource` records for the config lines that
+      decided the value. Scalar options follow OpenSSH's first-obtained-
+      value-wins rule and thus have exactly one record; list options such
+      as ``IdentityFile`` have one record per appended line, in order.
+
+    .. versionadded:: 3.5
+    """
+
+    def __init__(self, key, value, sources):
+        self.key = key
+        self.value = value
+        self.sources = list(sources)
+
+    @property
+    def source(self):
+        """
+        The `ConfigSource` that decided the final value.
+
+        For list-valued options this is the source of the last appended
+        element; consult ``sources`` for the full list. ``None`` if no
+        provenance was recorded.
+        """
+        if self.sources:
+            return self.sources[-1]
+        return None
+
+    @property
+    def raw_value(self):
+        """
+        The value as written in the config file, before token expansion.
+
+        For list-valued options this is a list of raw values parallel to
+        ``value``; otherwise it is the single raw string. Falls back to
+        ``value`` when no provenance was recorded.
+        """
+        if isinstance(self.value, list):
+            return [source.value for source in self.sources]
+        if self.sources:
+            return self.sources[-1].value
+        return self.value
+
+    def __repr__(self):
+        return "<{} {!r}={!r} (from {})>".format(
+            self.__class__.__name__, self.key, self.value, self.source
+        )
 
 
 class SSHConfigDict(dict):

@@ -1,0 +1,5 @@
+Host app-* !app-02
+    User appuser
+    IdentityFile ~/.ssh/%h_id
+
+Include include-grandchild

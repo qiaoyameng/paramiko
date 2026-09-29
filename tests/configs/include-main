@@ -1,0 +1,9 @@
+Host app-01
+    HostName %h.internal.example.com
+    Port 2201
+
+Include include-child
+
+Host *
+    Port 22
+    User default

@@ -1,0 +1,3 @@
+Host cycle-b
+    User b
+Include include-cycle-a

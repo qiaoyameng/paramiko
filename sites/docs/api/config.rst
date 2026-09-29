@@ -15,6 +15,11 @@ As with OpenSSH's own support, this dict will contain values from across the
 parsed file, depending on the order in which keywords were encountered and how
 specific or generic the ``Host`` or ``Match`` directives were.
 
+For debugging complex configs, `.SSHConfig.explain` performs the same lookup
+but also reports, for every keyword, which file, line number and
+``Host``/``Match`` condition decided the final value (along with the raw,
+pre-expansion value as written in the file).
+
 .. note:;
     Result keys are lowercased for consistency and ease of deduping, as the
     overall parsing/matching is itself case-insensitive. Thus, a source file
@@ -61,6 +66,14 @@ Paramiko releases) are included. A keyword by itself means no known departures.
 
 - ``Host``
 - ``HostName``: used in ``%h`` :ref:`token expansion <TOKENS>`
+- ``Include``: includes other config files inline (as if their contents
+  appeared at the directive's location). Accepts whitespace-separated,
+  possibly globbed paths; relative paths resolve against the directory of
+  the file containing the directive. Includes may be nested, and include
+  cycles raise `.ConfigParseError` with the offending chain of files.
+
+    .. versionadded:: 3.5
+
 - ``Match``: supports the keywords ``all``, ``canonical``, ``exec``, ``final``,
   ``host``, ``localuser``, ``originalhost``, and ``user``, with the following
   caveats:
