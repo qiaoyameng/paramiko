@@ -2,6 +2,15 @@
 Changelog
 =========
 
+- :feature:`-` Added client-side support for OpenSSH host certificates:
+  ``known_hosts`` files may now contain ``@cert-authority`` entries marking
+  CA keys trusted to sign host certificates, and ``@revoked`` entries
+  revoking specific host keys (revocation takes priority). When a server
+  presents a host certificate, it is validated against those CA keys --
+  checking certificate type (user certificates are never accepted as host
+  certificates), validity period, principals, critical options, and the CA
+  signature -- instead of requiring a per-host raw key. Plain host key
+  entries continue to work exactly as before.
 - :feature:`-` Added support for the ``mlkem768x25519-sha256`` post-quantum
   hybrid key exchange method described in
   ``draft-ietf-sshm-mlkem-hybrid-kex``. It pairs ML-KEM-768 (FIPS 203) with

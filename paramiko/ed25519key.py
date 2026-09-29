@@ -41,6 +41,10 @@ class Ed25519Key(PKey):
 
     name = "ssh-ed25519"
 
+    @classmethod
+    def identifiers(cls):
+        return [cls.name, "{}-cert-v01@openssh.com".format(cls.name)]
+
     def __init__(
         self, msg=None, data=None, filename=None, password=None, file_obj=None
     ):

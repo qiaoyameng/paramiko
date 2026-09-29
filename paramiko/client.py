@@ -443,7 +443,20 @@ class SSHClient(ClosingContextManager):
         t.start_client(timeout=timeout)
 
         server_key = t.get_remote_server_key()
-        if our_server_keys is None:
+        if HostKeys._is_certificate(server_key):
+            # The server identified itself with an OpenSSH host certificate;
+            # validate it against any @cert-authority CA keys (and @revoked
+            # entries) in the known hosts, instead of comparing raw keys.
+            if not (
+                self._system_host_keys.check(server_hostkey_name, server_key)
+                or self._host_keys.check(server_hostkey_name, server_key)
+            ):
+                raise SSHException(
+                    "Host certificate for {!r} is not trusted".format(
+                        server_hostkey_name
+                    )
+                )
+        elif our_server_keys is None:
             # will raise exception if the key is rejected
             self._policy.missing_host_key(
                 self, server_hostkey_name, server_key
