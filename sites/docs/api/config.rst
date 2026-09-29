@@ -61,6 +61,15 @@ Paramiko releases) are included. A keyword by itself means no known departures.
 
 - ``Host``
 - ``HostName``: used in ``%h`` :ref:`token expansion <TOKENS>`
+- ``Include``: may appear anywhere (including inside ``Host``/``Match``
+  blocks, whose context the included file continues, as in OpenSSH) and
+  accepts one or more glob patterns; matching files are inlined in lexical
+  order. Relative patterns resolve against the including file's directory,
+  unmatched patterns are silently ignored, and include cycles raise
+  `.ConfigParseError` with the chain of files involved.
+
+    .. versionadded:: 5.1
+
 - ``Match``: supports the keywords ``all``, ``canonical``, ``exec``, ``final``,
   ``host``, ``localuser``, ``originalhost``, and ``user``, with the following
   caveats:
@@ -119,6 +128,33 @@ In addition, we extend OpenSSH's tokens as follows:
 - ``~`` is treated like ``%d`` (expands to the local user's home directory
   path) when expanding ``ProxyCommand`` values, since ``ProxyCommand`` does not
   natively support ``%d`` for some reason.
+
+Explaining lookups
+==================
+
+When debugging complex configs (nested ``Include`` directives, negated
+``Host`` patterns, ``Match`` blocks, token expansion), the plain
+`.SSHConfig.lookup` result doesn't say *why* a value is what it is.
+`.SSHConfig.explain` performs the exact same lookup -- including
+canonicalization and ``Match`` evaluation, so ``Match exec`` commands are not
+run any additional times -- and returns an `.SSHConfigExplanation` pairing the
+final config with per-keyword provenance: source file, line number, the
+``Host``/``Match`` declaration responsible, and the pre-expansion value::
+
+    explanation = SSHConfig.from_path("ssh.conf").explain("web-01")
+    explanation.config            # identical to .lookup("web-01")
+    source = explanation.source("hostname")
+    source.raw_value              # e.g. "%h.internal" (as written)
+    source.value                  # e.g. "web-01.internal" (expanded)
+    source.path, source.line      # file & line of the winning assignment
+    source.block.declaration      # e.g. "Host web-* !web-bastion"
+
+OpenSSH's first-value-wins rule is preserved: for scalar keywords the first
+applied assignment is effective, and `.SSHConfigExplanation.sources` also
+lists later assignments that were shadowed. List-type keywords such as
+``IdentityFile`` yield one traceable record per appended value.
+
+.. versionadded:: 5.1
 
 
 .. _ssh_config: https://man.openbsd.org/ssh_config

@@ -1046,3 +1046,245 @@ class TestFinalMatching(object):
     def test_negated(self):
         result = load_config("match-final").lookup("jump")
         assert result["port"] == "1003"
+
+
+def _write_config(directory, name, text):
+    path = directory / name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+    return str(path)
+
+
+class TestInclude:
+    def test_basic_and_nested_relative_includes(self, tmp_path):
+        main = _write_config(
+            tmp_path,
+            "main.conf",
+            "Host *\n"
+            "    ServerAliveInterval 30\n"
+            "Include sub/*.conf\n"
+            "Host web-*\n"
+            "    User webuser\n",
+        )
+        _write_config(
+            tmp_path, "sub/ports.conf", "Host web-*\n    Port 2222\n"
+        )
+        # Nested include, resolved relative to the including file
+        _write_config(tmp_path, "sub/more.conf", "Include deep/c.conf\n")
+        _write_config(
+            tmp_path, "sub/deep/c.conf", "Host web-*\n    Compression yes\n"
+        )
+        result = SSHConfig.from_path(main).lookup("web-01")
+        assert result["serveraliveinterval"] == "30"
+        assert result["port"] == "2222"
+        assert result["compression"] == "yes"
+        assert result["user"] == "webuser"
+
+    def test_glob_matches_processed_in_lexical_order(self, tmp_path):
+        main = _write_config(
+            tmp_path, "main.conf", "Include conf.d/*.conf\n"
+        )
+        _write_config(tmp_path, "conf.d/01-first.conf", "User first\n")
+        _write_config(tmp_path, "conf.d/02-second.conf", "User second\n")
+        # First-value-wins, so lexical ordering of the glob decides
+        assert SSHConfig.from_path(main).lookup("any")["user"] == "first"
+
+    def test_unmatched_glob_is_silently_ignored(self, tmp_path):
+        main = _write_config(
+            tmp_path,
+            "main.conf",
+            "Include *.does-not-exist\nHost foo\n    User bar\n",
+        )
+        assert SSHConfig.from_path(main).lookup("foo")["user"] == "bar"
+
+    def test_include_inside_host_block_stays_in_block(self, tmp_path):
+        main = _write_config(
+            tmp_path,
+            "main.conf",
+            "Host special\n"
+            "    Include inner.conf\n"
+            "Host other\n"
+            "    User otheruser\n",
+        )
+        _write_config(tmp_path, "inner.conf", "    Port 2200\n")
+        config = SSHConfig.from_path(main)
+        assert config.lookup("special")["port"] == "2200"
+        assert "port" not in config.lookup("other")
+
+    def test_cycle_raises_with_include_chain(self, tmp_path):
+        a = _write_config(tmp_path, "a.conf", "Include b.conf\n")
+        b = _write_config(tmp_path, "b.conf", "Include a.conf\n")
+        with raises(ConfigParseError) as info:
+            SSHConfig.from_path(a)
+        message = str(info.value)
+        assert "Include cycle detected" in message
+        # Chain shows the full path back to the repeat offender
+        assert "{} -> {} -> {}".format(a, b, a) in message
+
+    def test_self_include_is_a_cycle(self, tmp_path):
+        path = _write_config(tmp_path, "self.conf", "Include self.conf\n")
+        with raises(ConfigParseError) as info:
+            SSHConfig.from_path(path)
+        assert "{} -> {}".format(path, path) in str(info.value)
+
+
+class TestExplain:
+    def _complex_config(self, tmp_path):
+        main = _write_config(
+            tmp_path,
+            "main.conf",
+            "ServerAliveInterval 30\n"
+            "Host *\n"
+            "    Compression no\n"
+            "Host web-* !web-bastion\n"
+            "    HostName %h.internal\n"
+            "    ControlPath ~/.ssh/cm-%n-%h.sock\n"
+            "    IdentityFile ~/.ssh/id_base\n"
+            "Host web-01\n"
+            "    User deploy\n"
+            "    IdentityFile ~/.ssh/id_web01\n"
+            "Include sub/*.conf\n",
+        )
+        _write_config(
+            tmp_path, "sub/ports.conf", "Host web-*\n    Port 2222\n"
+        )
+        _write_config(
+            tmp_path,
+            "sub/proxy.conf",
+            "Host web-01\n    ProxyCommand ssh gateway -W %h:%p\n",
+        )
+        return SSHConfig.from_path(main)
+
+    def test_final_config_matches_lookup_exactly(self, tmp_path):
+        config = self._complex_config(tmp_path)
+        for hostname in ("web-01", "web-bastion", "other.example.com"):
+            assert dict(config.explain(hostname).config) == dict(
+                config.lookup(hostname)
+            )
+
+    def test_source_file_line_and_block(self, tmp_path):
+        config = self._complex_config(tmp_path)
+        explanation = config.explain("web-01")
+        user = explanation.source("user")
+        assert user.path == str(tmp_path / "main.conf")
+        assert user.line == 9
+        assert user.raw_value == "deploy"
+        assert user.block.type == "host"
+        assert user.block.declaration == "Host web-01"
+        # Included file assignments point at the included file
+        proxy = explanation.source("proxycommand")
+        assert proxy.path == str(tmp_path / "sub" / "proxy.conf")
+        assert proxy.line == 2
+        port = explanation.source("port")
+        assert port.path == str(tmp_path / "sub" / "ports.conf")
+        assert port.value == "2222"
+        # Top-of-file settings live in the implicit global block
+        interval = explanation.source("serveraliveinterval")
+        assert interval.block.type == "global"
+        assert interval.block.path == str(tmp_path / "main.conf")
+        assert interval.line == 1
+
+    def test_raw_value_is_pre_expansion(self, tmp_path):
+        config = self._complex_config(tmp_path)
+        explanation = config.explain("web-01")
+        hostname = explanation.source("hostname")
+        assert hostname.raw_value == "%h.internal"
+        assert hostname.value == "web-01.internal"
+        controlpath = explanation.source("controlpath")
+        assert controlpath.raw_value == "~/.ssh/cm-%n-%h.sock"
+        assert controlpath.value == "~/.ssh/cm-web-01-web-01.internal.sock"
+        proxy = explanation.source("proxycommand")
+        assert proxy.raw_value == "ssh gateway -W %h:%p"
+        assert proxy.value == "ssh gateway -W web-01.internal:2222"
+
+    def test_scalar_first_value_wins_is_visible(self):
+        config = SSHConfig.from_text(
+            "Host foo\n    User first\nHost *\n    User second\n"
+        )
+        explanation = config.explain("foo")
+        assert explanation.config["user"] == "first"
+        first, second = explanation.sources("user")
+        assert first.effective and first.raw_value == "first"
+        assert not second.effective and second.raw_value == "second"
+        assert second.value is None
+        assert "shadowed" in second.note
+
+    def test_identityfile_appends_are_traceable(self):
+        config = SSHConfig.from_text(
+            "Host foo\n"
+            "    IdentityFile ~/.ssh/id_a\n"
+            "Host *\n"
+            "    IdentityFile ~/.ssh/id_b\n"
+            "    IdentityFile ~/.ssh/id_c\n"
+        )
+        explanation = config.explain("foo")
+        sources = explanation.sources("identityfile")
+        assert [x.raw_value for x in sources] == [
+            "~/.ssh/id_a",
+            "~/.ssh/id_b",
+            "~/.ssh/id_c",
+        ]
+        assert [x.line for x in sources] == [2, 4, 5]
+        assert all(x.effective for x in sources)
+        assert [x.value for x in sources] == [
+            expanduser("~/.ssh/id_" + letter) for letter in "abc"
+        ]
+        assert explanation.config["identityfile"] == [
+            x.value for x in sources
+        ]
+
+    def test_negated_host_patterns(self):
+        config = SSHConfig.from_text("Host * !bastion\n    User carol\n")
+        excluded = config.explain("bastion")
+        assert "user" not in excluded.config
+        included = config.explain("web")
+        assert included.config["user"] == "carol"
+        assert included.source("user").block.declaration == "Host * !bastion"
+        # And both agree with plain lookup
+        assert dict(included.config) == dict(config.lookup("web"))
+        assert dict(excluded.config) == dict(config.lookup("bastion"))
+
+    def test_match_block_source(self):
+        config = SSHConfig.from_text("Match all\n    User matched\n")
+        source = config.explain("whatever").source("user")
+        assert source.block.type == "match"
+        assert source.block.declaration == "Match all"
+
+    def test_implicit_hostname_is_synthetic(self):
+        config = SSHConfig.from_text("Host foo\n    User bob\n")
+        source = config.explain("foo").source("hostname")
+        assert source.effective
+        assert source.value == "foo"
+        assert source.path is None
+        assert source.note is not None
+
+    def test_canonicalized_hostname_overwrite_is_traced(self, socket):
+        socket.gethostbyname.return_value = "1.2.3.4"
+        config = SSHConfig.from_text(
+            "CanonicalizeHostname yes\nCanonicalDomains example.com\n"
+        )
+        explanation = config.explain("www")
+        assert dict(explanation.config) == dict(config.lookup("www"))
+        assert explanation.config["hostname"] == "www.example.com"
+        implicit, canonicalized = explanation.sources("hostname")
+        assert not implicit.effective
+        assert canonicalized.effective
+        assert canonicalized.note == "canonicalized hostname"
+        assert canonicalized.value == "www.example.com"
+
+    @mark.skipif(Result is None, reason="requires invoke package")
+    @patch("paramiko.config.invoke.run")
+    def test_match_exec_not_run_extra_times(self, run):
+        config = SSHConfig.from_text(
+            'Match exec "somecmd"\n    User ben\n'
+        )
+        run.side_effect = _expect("somecmd")
+        looked_up = config.lookup("whatever")
+        lookup_calls = run.call_count
+        assert lookup_calls > 0
+        run.reset_mock()
+        explained = config.explain("whatever")
+        # Explaining re-evaluates nothing: same exec count as a plain lookup
+        assert run.call_count == lookup_calls
+        assert dict(explained.config) == dict(looked_up)
+        assert explained.source("user").block.type == "match"
