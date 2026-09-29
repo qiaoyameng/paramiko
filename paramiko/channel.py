@@ -23,9 +23,10 @@ Abstraction for an SSH2 channel.
 import binascii
 import os
 import socket
-import time
 import threading
+import time
 
+from collections import namedtuple
 from functools import wraps
 
 from paramiko import util
@@ -47,6 +48,12 @@ from paramiko.file import BufferedFile
 from paramiko.buffered_pipe import BufferedPipe, PipeTimeout
 from paramiko import pipe
 from paramiko.util import ClosingContextManager
+
+
+ExitSignal = namedtuple(
+    "ExitSignal",
+    ("name", "core_dumped", "message", "language_tag"),
+)
 
 
 def open_only(func):
@@ -124,6 +131,7 @@ class Channel(ClosingContextManager):
         self.in_window_threshold = 0
         self.in_window_sofar = 0
         self.status_event = threading.Event()
+        self.exit_signal_event = threading.Event()
         self._name = str(chanid)
         self.logger = util.get_logger("paramiko.transport")
         self._pipe = None
@@ -131,6 +139,9 @@ class Channel(ClosingContextManager):
         self.event_ready = False
         self.combine_stderr = False
         self.exit_status = -1
+        self.exit_signal = None
+        self.exit_status_received = False
+        self.exit_signal_received = False
         self.origin_addr = None
 
     def __del__(self):
@@ -364,7 +375,8 @@ class Channel(ClosingContextManager):
         Return true if the remote process has exited and returned an exit
         status. You may use this to poll the process status if you don't
         want to block in `recv_exit_status`. Note that the server may not
-        return an exit status in some cases (like bad servers).
+        return an exit status in some cases (like bad servers, or processes
+        terminated by a signal).
 
         :return:
             ``True`` if `recv_exit_status` will return immediately, else
@@ -373,6 +385,16 @@ class Channel(ClosingContextManager):
         .. versionadded:: 1.7.3
         """
         return self.closed or self.status_event.is_set()
+
+    def exit_signal_ready(self):
+        """
+        Return true if the remote process was terminated by a signal.
+
+        :return:
+            ``True`` if an exit signal is available or the channel is closed
+            without one, else ``False``.
+        """
+        return self.closed or self.exit_signal_received
 
     def recv_exit_status(self):
         """
@@ -421,6 +443,53 @@ class Channel(ClosingContextManager):
         m.add_boolean(False)
         m.add_int(status)
         self.transport._send_user_message(m)
+
+    def send_exit_signal(
+        self,
+        signal_name,
+        core_dumped=False,
+        error_message="",
+        language_tag="",
+    ):
+        """
+        Send the signal that terminated an executed command to the client.
+
+        This is normally only used by servers. The request fields are defined
+        by the SSH channel protocol and distinguish a process terminated by a
+        signal from a normal `exit-status` result.
+
+        :param str signal_name:
+            signal name without its ``SIG`` prefix, such as ``"TERM"``.
+        :param bool core_dumped:
+            whether the process produced a core dump.
+        :param str error_message:
+            optional human-readable error message.
+        :param str language_tag:
+            optional language tag for ``error_message``.
+        """
+        m = Message()
+        m.add_byte(cMSG_CHANNEL_REQUEST)
+        m.add_int(self.remote_chanid)
+        m.add_string("exit-signal")
+        m.add_boolean(False)
+        m.add_string(signal_name)
+        m.add_boolean(core_dumped)
+        m.add_string(error_message)
+        m.add_string(language_tag)
+        self.transport._send_user_message(m)
+
+    def recv_exit_signal(self):
+        """
+        Wait for and return the signal that terminated the remote process.
+
+        :return:
+            an `.ExitSignal` tuple containing the signal name, core-dump flag,
+            error message, and language tag, or ``None`` if the channel closed
+            without an ``exit-signal`` request.
+        """
+        self.exit_signal_event.wait()
+        assert self.exit_signal_event.is_set()
+        return self.exit_signal
 
     @open_only
     def request_x11(
@@ -1074,8 +1143,39 @@ class Channel(ClosingContextManager):
         server = self.transport.server_object
         ok = False
         if key == "exit-status":
-            self.exit_status = m.get_int()
-            self.status_event.set()
+            status = m.get_int()
+            self.lock.acquire()
+            try:
+                if not (
+                    self.exit_status_received or self.exit_signal_received
+                ):
+                    self.exit_status = status
+                    self.exit_status_received = True
+                    self.status_event.set()
+            finally:
+                self.lock.release()
+            ok = True
+        elif key == "exit-signal":
+            signal_name = m.get_text()
+            core_dumped = m.get_boolean()
+            error_message = m.get_text()
+            lang_tag = m.get_text()
+            self.lock.acquire()
+            try:
+                if not (
+                    self.exit_status_received or self.exit_signal_received
+                ):
+                    self.exit_signal = ExitSignal(
+                        signal_name,
+                        core_dumped,
+                        error_message,
+                        lang_tag,
+                    )
+                    self.exit_signal_received = True
+                    self.exit_signal_event.set()
+                    self.status_event.set()
+            finally:
+                self.lock.release()
             ok = True
         elif key == "xon-xoff":
             # ignore
@@ -1232,6 +1332,7 @@ class Channel(ClosingContextManager):
         # Notify any waiters that we are closed
         self.event.set()
         self.status_event.set()
+        self.exit_signal_event.set()
         if self._pipe is not None:
             self._pipe.set_forever()
 

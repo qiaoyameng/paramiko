@@ -33,6 +33,7 @@ from unittest.mock import Mock
 from pytest import mark, raises
 
 from paramiko import (
+    Channel,
     OPEN_FAILED_ADMINISTRATIVELY_PROHIBITED,
     AuthHandler,
     ChannelException,
@@ -365,6 +366,127 @@ class TransportTest(unittest.TestCase):
                 raise Exception("timeout")
         self.assertEqual(23, chan.recv_exit_status())
         chan.close()
+
+    def test_exit_signal(self):
+        self.setup_test_server()
+
+        chan = self.tc.open_session()
+        schan = self.ts.accept(1.0)
+        chan.exec_command("yes")
+
+        schan.send_stderr(b"fatal error\n")
+        schan.send_exit_signal(
+            "TERM",
+            core_dumped=True,
+            error_message="terminated",
+            language_tag="en_US.UTF-8",
+        )
+        schan.close()
+
+        signal = chan.recv_exit_signal()
+        expected = ("TERM", True, "terminated", "en_US.UTF-8")
+        self.assertEqual(expected, signal)
+        self.assertEqual("TERM", signal.name)
+        self.assertTrue(signal.core_dumped)
+        self.assertEqual("terminated", signal.message)
+        self.assertEqual("en_US.UTF-8", signal.language_tag)
+        self.assertEqual(-1, chan.recv_exit_status())
+        self.assertTrue(chan.exit_status_ready())
+        self.assertTrue(chan.exit_signal_ready())
+        chan.close()
+        self.assertEqual(b"fatal error\n", chan.recv_stderr(12))
+        self.assertEqual(b"", chan.recv_stderr(1))
+
+    def test_exit_signal_after_eof(self):
+        self.setup_test_server()
+
+        chan = self.tc.open_session()
+        schan = self.ts.accept(1.0)
+        chan.exec_command("yes")
+
+        schan.send_stderr(b"late signal\n")
+        schan.shutdown_write()
+        schan.send_exit_signal("SEGV", core_dumped=False)
+        schan.close()
+
+        self.assertEqual(("SEGV", False, "", ""), chan.recv_exit_signal())
+        self.assertEqual(-1, chan.recv_exit_status())
+        self.assertTrue(chan.exit_status_ready())
+        self.assertTrue(chan.exit_signal_ready())
+        chan.close()
+        self.assertEqual(b"late signal\n", chan.recv_stderr(12))
+        self.assertEqual(b"", chan.recv_stderr(1))
+
+    def test_first_exit_notification_wins(self):
+        status_channel = Channel(0)
+        status_channel.transport = Mock()
+        status_request = Message()
+        status_request.add_string("exit-status")
+        status_request.add_boolean(False)
+        status_request.add_int(7)
+        duplicate_status_request = Message()
+        duplicate_status_request.add_string("exit-status")
+        duplicate_status_request.add_boolean(False)
+        duplicate_status_request.add_int(8)
+        signal_request = Message()
+        signal_request.add_string("exit-signal")
+        signal_request.add_boolean(False)
+        signal_request.add_string("TERM")
+        signal_request.add_boolean(True)
+        signal_request.add_string("terminated")
+        signal_request.add_string("en_US.UTF-8")
+
+        status_request.rewind()
+        duplicate_status_request.rewind()
+        signal_request.rewind()
+        status_channel._handle_request(status_request)
+        status_channel._handle_request(duplicate_status_request)
+        status_channel._handle_request(signal_request)
+
+        self.assertEqual(7, status_channel.exit_status)
+        self.assertIsNone(status_channel.exit_signal)
+        self.assertTrue(status_channel.status_event.is_set())
+        self.assertFalse(status_channel.exit_signal_event.is_set())
+
+        signal_channel = Channel(0)
+        signal_channel.transport = Mock()
+        signal_request.rewind()
+        conflicting_status_request = Message()
+        conflicting_status_request.add_string("exit-status")
+        conflicting_status_request.add_boolean(False)
+        conflicting_status_request.add_int(8)
+        conflicting_status_request.rewind()
+
+        signal_channel._handle_request(signal_request)
+        signal_channel._handle_request(conflicting_status_request)
+
+        self.assertEqual(-1, signal_channel.exit_status)
+        self.assertEqual(
+            ("TERM", True, "terminated", "en_US.UTF-8"),
+            signal_channel.exit_signal,
+        )
+        self.assertTrue(signal_channel.exit_signal_event.is_set())
+
+    def test_exit_notifications_wait_for_eof_without_hanging(self):
+        channel = Channel(0)
+        channel.transport = Mock()
+        channel.active = True
+        eof_message = Message()
+
+        channel._handle_eof(eof_message)
+
+        self.assertFalse(channel.status_event.is_set())
+        self.assertFalse(channel.exit_signal_event.is_set())
+        self.assertFalse(channel.exit_status_ready())
+        self.assertFalse(channel.exit_signal_ready())
+
+        close_message = Message()
+        channel._handle_close(close_message)
+
+        self.assertTrue(channel.status_event.is_set())
+        self.assertTrue(channel.exit_signal_event.is_set())
+        self.assertEqual(-1, channel.recv_exit_status())
+        self.assertIsNone(channel.recv_exit_signal())
 
     def test_select(self):
         """

@@ -64,6 +64,7 @@ class UtilTest(unittest.TestCase):
             "CouldNotCanonicalize",
             "ECDSAKey",
             "Ed25519Key",
+            "ExitSignal",
             "HostKeys",
             "InMemoryPrivateKey",
             "Message",
