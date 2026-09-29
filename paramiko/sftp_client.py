@@ -32,7 +32,12 @@ from paramiko.sftp import (
     BaseSFTP,
     CMD_OPENDIR,
     CMD_HANDLE,
+    CMD_EXTENDED_REPLY,
+    EXT_CONDITIONAL_COMMIT,
+    EXT_GET_FILE_VERSION,
     SFTPError,
+    FileVersionConflict,
+    VERSION_CONFLICT,
     CMD_READDIR,
     CMD_NAME,
     CMD_CLOSE,
@@ -67,6 +72,10 @@ from paramiko.sftp_attr import SFTPAttributes
 from paramiko.ssh_exception import SSHException
 from paramiko.sftp_file import SFTPFile
 from paramiko.util import ClosingContextManager, b, u
+
+
+def _random_suffix():
+    return hexlify(os.urandom(8)).decode("ascii")
 
 
 def _to_unicode(s):
@@ -443,6 +452,172 @@ class SFTPClient(BaseSFTP, ClosingContextManager):
         self._request(
             CMD_EXTENDED, "posix-rename@openssh.com", oldpath, newpath
         )
+
+    def _require_extension(self, name):
+        """
+        Ensure the server advertised support for the given extension.
+
+        Conditional (compare-and-swap) writes are only safe when the server
+        performs the version check and the replace atomically, so we refuse
+        to proceed -- rather than emulating them with a non-atomic
+        stat-then-rename -- when the extension is missing.
+        """
+        if name not in self.server_extensions:
+            raise SFTPError(
+                "Server does not support the {!r} extension; refusing "
+                "conditional write mode (no stat+rename fallback)".format(
+                    name
+                )
+            )
+
+    def get_file_version(self, path):
+        """
+        Fetch the server-generated version tag for ``path``.
+
+        The returned string is opaque: it is only meaningful as the
+        ``expected_version`` argument to `conditional_commit` (or
+        `conditional_put`/`conditional_putfo`).  It changes every time the
+        file is replaced on the server.
+
+        :param str path: path of the remote file
+        :return: the file's current version tag, as a `str`
+
+        :raises SFTPError:
+            if the server does not support the ``get-file-version@paramiko``
+            extension
+        :raises IOError: if the file does not exist
+        """
+        self._require_extension(EXT_GET_FILE_VERSION)
+        path = self._adjust_cwd(path)
+        t, msg = self._request(CMD_EXTENDED, EXT_GET_FILE_VERSION, path)
+        if t != CMD_EXTENDED_REPLY:
+            raise SFTPError(
+                "Unexpected response to get-file-version request"
+            )
+        return msg.get_text()
+
+    def conditional_commit(self, tmp_path, target_path, expected_version):
+        """
+        Atomically replace ``target_path`` with the (already uploaded)
+        ``tmp_path``, but only if the target's current version still equals
+        ``expected_version``.
+
+        The check and the replace happen as a single atomic operation on the
+        server, so the target is never observed as a partial file and a
+        concurrent writer can never be silently overwritten.
+
+        :param str tmp_path:
+            path of the temp file previously uploaded to the same remote
+            folder as the target
+        :param str target_path: path of the file to replace
+        :param str expected_version:
+            version tag previously obtained from `get_file_version`
+        :return: the target's new version tag, as a `str`
+
+        :raises FileVersionConflict:
+            if the target's version no longer matches ``expected_version``
+        :raises SFTPError:
+            if the server does not support the
+            ``conditional-commit@paramiko`` extension
+        """
+        self._require_extension(EXT_CONDITIONAL_COMMIT)
+        tmp_path = self._adjust_cwd(tmp_path)
+        target_path = self._adjust_cwd(target_path)
+        self._log(
+            DEBUG,
+            "conditional_commit({!r}, {!r}, {!r})".format(
+                tmp_path, target_path, expected_version
+            ),
+        )
+        try:
+            t, msg = self._request(
+                CMD_EXTENDED,
+                EXT_CONDITIONAL_COMMIT,
+                tmp_path,
+                target_path,
+                expected_version,
+            )
+        except IOError as e:
+            # the server signals a version mismatch with a failure status
+            # whose text starts with the VERSION_CONFLICT marker
+            if e.args and str(e.args[0]).startswith(VERSION_CONFLICT):
+                raise FileVersionConflict(
+                    str(e.args[0])[len(VERSION_CONFLICT):].lstrip(": ")
+                ) from e
+            raise
+        if t != CMD_EXTENDED_REPLY:
+            raise SFTPError(
+                "Unexpected response to conditional-commit request"
+            )
+        return msg.get_text()
+
+    def _conditional_tmp_path(self, remotepath):
+        # unique per client & attempt, so cleanup can never remove another
+        # client's (or an earlier attempt's) temp file
+        return "{}.condtmp-{}-{}".format(
+            remotepath, os.getpid(), _random_suffix()
+        )
+
+    def conditional_putfo(
+        self, fl, remotepath, expected_version=None, callback=None
+    ):
+        """
+        Write the contents of file-like object ``fl`` to ``remotepath``,
+        atomically and conditionally on the remote file's version.
+
+        The data is first uploaded to a uniquely-named temp file in the same
+        remote folder, then committed with `conditional_commit`.  If anything
+        fails, only this client's own temp file is removed; the target (and
+        anyone else's files) are left untouched.
+
+        :param fl: opened file or file-like object to copy
+        :param str remotepath: the destination path on the SFTP server
+        :param str expected_version:
+            version tag the edit was based on; if `None`,
+            `get_file_version` is called first to obtain it
+        :param callable callback: optional progress callback, as for `putfo`
+        :return: the target's new version tag, as a `str`
+
+        :raises FileVersionConflict:
+            if the target was modified by someone else in the meantime
+        :raises SFTPError:
+            if the server does not support conditional writes
+        """
+        if expected_version is None:
+            expected_version = self.get_file_version(remotepath)
+        else:
+            self._require_extension(EXT_CONDITIONAL_COMMIT)
+        tmp_path = self._conditional_tmp_path(remotepath)
+        try:
+            self.putfo(fl, tmp_path, callback=callback)
+            return self.conditional_commit(
+                tmp_path, remotepath, expected_version
+            )
+        except Exception:
+            # clean up only our own temp file; never touch the target
+            try:
+                self.remove(tmp_path)
+            except IOError:
+                pass
+            raise
+
+    def conditional_put(self, localpath, remotepath, expected_version=None):
+        """
+        Write local file ``localpath`` to ``remotepath``, atomically and
+        conditionally on the remote file's version.  See `conditional_putfo`
+        for details.
+
+        :param str localpath: the local file to copy
+        :param str remotepath: the destination path on the SFTP server
+        :param str expected_version:
+            version tag the edit was based on; if `None`,
+            `get_file_version` is called first to obtain it
+        :return: the target's new version tag, as a `str`
+        """
+        with open(localpath, "rb") as fl:
+            return self.conditional_putfo(
+                fl, remotepath, expected_version=expected_version
+            )
 
     def mkdir(self, path, mode=o777):
         """

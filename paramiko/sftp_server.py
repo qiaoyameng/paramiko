@@ -36,6 +36,9 @@ from paramiko.sftp import (
     CMD_DATA,
     CMD_EXTENDED,
     CMD_EXTENDED_REPLY,
+    EXT_CONDITIONAL_COMMIT,
+    EXT_GET_FILE_VERSION,
+    FileVersionConflict,
     CMD_FSETSTAT,
     CMD_FSTAT,
     CMD_HANDLE,
@@ -134,7 +137,16 @@ class SFTPServer(BaseSFTP, SubsystemHandler):
     def start_subsystem(self, name, transport, channel):
         self.sock = channel
         self._log(DEBUG, "Started sftp server on channel {!r}".format(channel))
-        self._send_server_version()
+        # advertise "check-file" unconditionally, and the conditional-write
+        # extensions only if the SFTPServerInterface subclass actually
+        # implements them (so clients can rely on the advertisement)
+        extension_pairs = ["check-file", "md5,sha1"]
+        si = type(self.server)
+        if si.get_file_version is not SFTPServerInterface.get_file_version:
+            extension_pairs += [EXT_GET_FILE_VERSION, "1"]
+        if si.conditional_commit is not SFTPServerInterface.conditional_commit:
+            extension_pairs += [EXT_CONDITIONAL_COMMIT, "1"]
+        self._send_server_version(extension_pairs)
         self.server.session_started()
         while True:
             try:
@@ -374,6 +386,31 @@ class SFTPServer(BaseSFTP, SubsystemHandler):
             flags |= os.O_EXCL
         return flags
 
+    def _get_file_version(self, request_number, msg):
+        path = msg.get_text()
+        resp = self.server.get_file_version(path)
+        if isinstance(resp, str):
+            self._response(request_number, CMD_EXTENDED_REPLY, resp)
+        else:
+            # must be an error code
+            self._send_status(request_number, resp)
+
+    def _conditional_commit(self, request_number, msg):
+        tmp_path = msg.get_text()
+        target_path = msg.get_text()
+        expected_version = msg.get_text()
+        resp = self.server.conditional_commit(
+            tmp_path, target_path, expected_version
+        )
+        if isinstance(resp, str):
+            # success: reply with the target's new version tag
+            self._response(request_number, CMD_EXTENDED_REPLY, resp)
+        elif isinstance(resp, FileVersionConflict):
+            self._send_status(request_number, SFTP_FAILURE, str(resp))
+        else:
+            # must be an error code
+            self._send_status(request_number, resp)
+
     def _process(self, t, request_number, msg):
         self._log(DEBUG, "Request: {}".format(CMD_NAMES[t]))
         if t == CMD_OPEN:
@@ -523,6 +560,10 @@ class SFTPServer(BaseSFTP, SubsystemHandler):
             tag = msg.get_text()
             if tag == "check-file":
                 self._check_file(request_number, msg)
+            elif tag == EXT_GET_FILE_VERSION:
+                self._get_file_version(request_number, msg)
+            elif tag == EXT_CONDITIONAL_COMMIT:
+                self._conditional_commit(request_number, msg)
             elif tag == "posix-rename@openssh.com":
                 oldpath = msg.get_text()
                 newpath = msg.get_text()

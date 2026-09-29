@@ -221,6 +221,49 @@ class SFTPServerInterface:
         """
         return SFTP_OP_UNSUPPORTED
 
+    def get_file_version(self, path):
+        """
+        Return a server-generated, opaque version tag for the file at
+        ``path``.  The tag must change every time the file's contents are
+        replaced.  Clients use it to implement conditional (compare-and-swap)
+        writes via `conditional_commit`.
+
+        This implements the server side of the ``get-file-version@paramiko``
+        extension; the extension is only advertised to clients when this
+        method is overridden.
+
+        :param str path:
+            the requested path (relative or absolute) of the file.
+        :return:
+            the file's current version tag as a `str`, or an SFTP error code
+            `int` like ``SFTP_NO_SUCH_FILE``.
+        """
+        return SFTP_OP_UNSUPPORTED
+
+    def conditional_commit(self, tmp_path, target_path, expected_version):
+        """
+        Atomically replace ``target_path`` with the previously uploaded
+        ``tmp_path``, but only if the target's current version tag equals
+        ``expected_version``.  The version check and the replacement must
+        happen as a single atomic step (under a lock, using an atomic
+        rename), so the target is never observed as a partial file and a
+        concurrent writer is never silently overwritten.
+
+        This implements the server side of the
+        ``conditional-commit@paramiko`` extension; the extension is only
+        advertised to clients when this method is overridden.
+
+        :param str tmp_path: path of the uploaded temp file.
+        :param str target_path: path of the file to replace.
+        :param str expected_version:
+            version tag the client obtained earlier via `get_file_version`.
+        :return:
+            the target's new version tag as a `str` on success; a
+            `.FileVersionConflict` instance if the versions don't match; or
+            an SFTP error code `int` like ``SFTP_FAILURE``.
+        """
+        return SFTP_OP_UNSUPPORTED
+
     def mkdir(self, path, attr):
         """
         Create a new directory with the given attributes.  The ``attr``

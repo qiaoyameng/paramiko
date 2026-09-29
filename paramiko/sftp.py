@@ -83,6 +83,17 @@ SFTP_FLAG_EXCL = 0x20
 
 _VERSION = 3
 
+# vendor extension names for conditional (compare-and-swap) writes.
+# "get-file-version" returns a server-generated, opaque version tag for a
+# path; "conditional-commit" atomically replaces a target path with a
+# previously uploaded temp file iff the target's current version matches the
+# version the client based its edit on.
+EXT_GET_FILE_VERSION = "get-file-version@paramiko"
+EXT_CONDITIONAL_COMMIT = "conditional-commit@paramiko"
+
+#: status text prefix used to signal a version conflict on conditional commit
+VERSION_CONFLICT = "VersionConflict"
+
 
 # for debugging
 CMD_NAMES = {
@@ -130,11 +141,25 @@ class SFTPError(Exception):
     pass
 
 
+class FileVersionConflict(IOError):
+    """
+    Raised when a conditional commit fails because the target file's version
+    no longer matches the version the caller based their changes on (i.e.
+    someone else modified the file in the meantime).
+    """
+
+    def __init__(self, message):
+        super().__init__("{}: {}".format(VERSION_CONFLICT, message))
+
+
 class BaseSFTP:
     def __init__(self):
         self.logger = util.get_logger("paramiko.sftp")
         self.sock = None
         self.ultra_debug = False
+        # map of extension name -> extension data, sent by the server in its
+        # version packet (filled in by _send_version on the client side)
+        self.server_extensions = {}
 
     # ...internals...
 
@@ -148,17 +173,23 @@ class BaseSFTP:
         version = struct.unpack(">I", data[:4])[0]
         #        if version != _VERSION:
         #            raise SFTPError('Incompatible sftp protocol')
+        # parse any extension name/data pairs trailing the version number
+        ext = Message(data[4:])
+        while ext.packet.tell() < len(data) - 4:
+            name = ext.get_text()
+            self.server_extensions[name] = ext.get_string()
         return version
 
-    def _send_server_version(self):
+    def _send_server_version(self, extension_pairs=None):
         # winscp will freak out if the server sends version info before the
         # client finishes sending INIT.
         t, data = self._read_packet()
         if t != CMD_INIT:
             raise SFTPError("Incompatible sftp protocol")
         version = struct.unpack(">I", data[:4])[0]
-        # advertise that we support "check-file"
-        extension_pairs = ["check-file", "md5,sha1"]
+        if extension_pairs is None:
+            # advertise that we support "check-file"
+            extension_pairs = ["check-file", "md5,sha1"]
         msg = Message()
         msg.add_int(_VERSION)
         msg.add(*extension_pairs)
