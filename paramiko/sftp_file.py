@@ -69,6 +69,19 @@ class SFTPFile(BufferedFile):
         self._prefetch_data = {}
         self._prefetch_extents = {}
         self._prefetch_lock = threading.Lock()
+        self._prefetch_condition = threading.Condition(self._prefetch_lock)
+        self._prefetch_pending = deque()
+        self._prefetch_ranges = None
+        self._prefetch_cached_bytes = 0
+        self._prefetch_peak_cached_bytes = 0
+        self._prefetch_byte_budget = None
+        self._prefetch_generation = 0
+        self._prefetch_active = False
+        self._prefetch_thread_handle = None
+        self._prefetch_closing = False
+        self._prefetch_mode = None
+        self._prefetch_waiting_offset = None
+        self._prefetch_max_concurrent_requests = None
         self._saved_exception = None
         self._reqs = deque()
 
@@ -94,6 +107,23 @@ class SFTPFile(BufferedFile):
         self.sftp._log(DEBUG, "close({})".format(u(hexlify(self.handle))))
         if self.pipelined:
             self.sftp._finish_responses(self)
+        thread = None
+        with self._prefetch_condition:
+            self._prefetch_closing = True
+            self._prefetch_active = False
+            self._prefetch_pending.clear()
+            self._prefetch_generation += 1
+            self._prefetch_condition.notify_all()
+            thread = self._prefetch_thread_handle
+        if thread is not None and thread is not threading.current_thread():
+            thread.join()
+        exception = None
+        if not async_:
+            try:
+                self.sftp._finish_responses(self)
+                self._check_exception()
+            except Exception as e:
+                exception = e
         BufferedFile.close(self)
         try:
             if async_:
@@ -108,26 +138,31 @@ class SFTPFile(BufferedFile):
         except (IOError, socket.error):
             # may have outlived the Transport connection
             pass
+        if exception is not None:
+            raise exception
 
     def _data_in_prefetch_requests(self, offset, size):
-        k = [
-            x for x in list(self._prefetch_extents.values()) if x[0] <= offset
-        ]
-        if len(k) == 0:
-            return False
-        k.sort(key=lambda x: x[0])
-        buf_offset, buf_size = k[-1]
-        if buf_offset + buf_size <= offset:
-            # prefetch request ends before this one begins
-            return False
-        if buf_offset + buf_size >= offset + size:
-            # inclusive
-            return True
-        # well, we have part of the request.  see if another chunk has
-        # the rest.
-        return self._data_in_prefetch_requests(
-            buf_offset + buf_size, offset + size - buf_offset - buf_size
-        )
+        with self._prefetch_condition:
+            intervals = [
+                (request_offset, request_offset + length)
+                for request_offset, length, *_ in (
+                    list(self._prefetch_extents.values())
+                    + list(self._prefetch_pending)
+                )
+            ]
+
+            def covered(start, end):
+                candidates = [
+                    interval_end
+                    for interval_start, interval_end in intervals
+                    if interval_start <= start < interval_end
+                ]
+                if not candidates:
+                    return False
+                next_end = max(candidates)
+                return next_end >= end or covered(next_end, end)
+
+            return covered(offset, offset + size)
 
     def _data_in_prefetch_buffers(self, offset):
         """
@@ -136,15 +171,187 @@ class SFTPFile(BufferedFile):
         return None.  this guarantees nothing about the number of bytes
         collected in the prefetch buffer so far.
         """
-        k = [i for i in self._prefetch_data.keys() if i <= offset]
-        if len(k) == 0:
+        with self._prefetch_condition:
+            return self._data_in_prefetch_buffers_locked(offset)
+
+    def _data_in_prefetch_buffers_locked(self, offset):
+        keys = [i for i in self._prefetch_data.keys() if i <= offset]
+        if not keys:
             return None
-        index = max(k)
-        buf_offset = offset - index
-        if buf_offset >= len(self._prefetch_data[index]):
-            # it's not here
+        index = max(keys)
+        if offset - index >= len(self._prefetch_data[index]):
             return None
         return index
+
+    def _add_prefetch_data_locked(self, offset, data):
+        old_data = self._prefetch_data.get(offset, b"")
+        self._prefetch_cached_bytes += len(data) - len(old_data)
+        self._prefetch_data[offset] = data
+        self._prefetch_peak_cached_bytes = max(
+            self._prefetch_peak_cached_bytes,
+            self._prefetch_cached_bytes,
+        )
+
+    def _remove_prefetch_data_locked(self, offset):
+        data = self._prefetch_data.pop(offset, b"")
+        self._prefetch_cached_bytes -= len(data)
+        return data
+
+    @staticmethod
+    def _merge_ranges(ranges):
+        ranges = sorted(
+            (start, end) for start, end in ranges if start < end
+        )
+        merged = []
+        for start, end in ranges:
+            if not merged or start >= merged[-1][1]:
+                merged.append([start, end])
+            else:
+                merged[-1][1] = max(merged[-1][1], end)
+        return [(start, end) for start, end in merged]
+
+    @classmethod
+    def _range_intersects(cls, ranges, start, end):
+        return any(
+            start < range_end and range_start < end
+            for range_start, range_end in ranges
+        )
+
+    @classmethod
+    def _subtract_range(cls, ranges, start, end):
+        result = []
+        for range_start, range_end in ranges:
+            if end <= range_start or start >= range_end:
+                result.append((range_start, range_end))
+            else:
+                if range_start < start:
+                    result.append((range_start, start))
+                if end < range_end:
+                    result.append((end, range_end))
+        return result
+
+    def _discard_unwanted_prefetch_data_locked(self):
+        ranges = self._prefetch_ranges or []
+        for data_offset in list(self._prefetch_data):
+            data = self._prefetch_data[data_offset]
+            data_end = data_offset + len(data)
+            kept = None
+            for range_start, range_end in ranges:
+                if data_offset < range_end and range_start < data_end:
+                    kept = (
+                        max(data_offset, range_start),
+                        min(data_end, range_end),
+                    )
+                    break
+            if kept is None:
+                self._remove_prefetch_data_locked(data_offset)
+            elif kept != (data_offset, data_end):
+                start, end = kept
+                trimmed = data[start - data_offset : end - data_offset]
+                self._remove_prefetch_data_locked(data_offset)
+                self._add_prefetch_data_locked(start, trimmed)
+
+    def _coverage_end_locked(self, offset, exclude_pending=False):
+        candidates = []
+        for data_offset, data in self._prefetch_data.items():
+            data_end = data_offset + len(data)
+            if data_offset <= offset < data_end:
+                candidates.append(data_end)
+        requests = list(self._prefetch_extents.values())
+        if not exclude_pending:
+            requests += list(self._prefetch_pending)
+        for request_offset, length, *_ in requests:
+            request_end = request_offset + length
+            if request_offset <= offset < request_end:
+                candidates.append(request_end)
+        return max(candidates, default=offset)
+
+    def _add_missing_prefetch_chunks_locked(self, position):
+        if self._prefetch_mode != "sequential" or not self._prefetch_ranges:
+            return
+        end = self._prefetch_ranges[-1][1]
+        missing = []
+        offset = position
+        while offset < end:
+            coverage_end = self._coverage_end_locked(offset)
+            if coverage_end > offset:
+                offset = coverage_end
+                continue
+            length = min(self.MAX_REQUEST_SIZE, end - offset)
+            missing.append((offset, length))
+            offset += length
+        if not missing:
+            return
+        missing_keys = set(missing)
+        retained = deque(
+            chunk
+            for chunk in self._prefetch_pending
+            if (chunk[0], chunk[1]) not in missing_keys
+        )
+        generation = self._prefetch_generation
+        self._prefetch_pending = deque(
+            (offset, length, generation) for offset, length in missing
+        )
+        self._prefetch_pending.extend(retained)
+
+    def _update_sequential_demand_locked(self, position):
+        if self._prefetch_mode != "sequential":
+            return
+        end = self._prefetch_ranges[-1][1] if self._prefetch_ranges else 0
+        if position >= end:
+            self._prefetch_ranges = []
+        else:
+            self._prefetch_ranges = self._merge_ranges([(position, end)])
+        generation = self._prefetch_generation
+        self._prefetch_pending = deque(
+            chunk
+            for chunk in self._prefetch_pending
+            if chunk[2] == generation
+            and self._range_intersects(
+                self._prefetch_ranges, chunk[0], chunk[0] + chunk[1]
+            )
+        )
+        self._discard_unwanted_prefetch_data_locked()
+        self._add_missing_prefetch_chunks_locked(position)
+
+    def _seek_prefetch(self, position):
+        with self._prefetch_condition:
+            self._prefetch_waiting_offset = position
+            if self._prefetch_mode == "sequential":
+                self._prefetch_done = False
+                self._update_sequential_demand_locked(position)
+            else:
+                for index, chunk in enumerate(self._prefetch_pending):
+                    chunk_offset, chunk_length, _ = chunk
+                    if (
+                        chunk_offset <= position
+                        < chunk_offset + chunk_length
+                    ):
+                        self._prefetch_pending.rotate(-index)
+                        break
+            self._prefetch_condition.notify_all()
+
+    def cancel_prefetch(self):
+        """
+        Cancel prefetch requests which have not been sent yet.
+
+        Data already received remains readable. Responses for requests already
+        in flight are consumed and discarded instead of being mistaken for
+        another request's response.
+        """
+        thread = None
+        with self._prefetch_condition:
+            self._prefetch_generation += 1
+            self._prefetch_active = False
+            self._prefetch_pending.clear()
+            self._prefetch_ranges = []
+            self._prefetch_mode = None
+            self._prefetch_done = True
+            self._prefetch_closing = False
+            self._prefetch_condition.notify_all()
+            thread = self._prefetch_thread_handle
+        if thread is not None and thread is not threading.current_thread():
+            thread.join()
 
     def _read_prefetch(self, size):
         """
@@ -154,26 +361,38 @@ class SFTPFile(BufferedFile):
         # while not closed, and haven't fetched past the current position,
         # and haven't reached EOF...
         while True:
-            offset = self._data_in_prefetch_buffers(self._realpos)
-            if offset is not None:
-                break
-            if self._prefetch_done or self._closed:
+            with self._prefetch_condition:
+                self._prefetch_waiting_offset = self._realpos
+                offset = self._data_in_prefetch_buffers_locked(
+                    self._realpos
+                )
+                done = self._prefetch_done or self._closed
+                exception = self._saved_exception is not None
+                should_notify = offset is None
+                if should_notify:
+                    self._prefetch_condition.notify_all()
+            if offset is not None or done or exception:
                 break
             self.sftp._read_response()
             self._check_exception()
-        if offset is None:
-            self._prefetching = False
-            return None
-        prefetch = self._prefetch_data[offset]
-        del self._prefetch_data[offset]
-
-        buf_offset = self._realpos - offset
-        if buf_offset > 0:
-            self._prefetch_data[offset] = prefetch[:buf_offset]
-            prefetch = prefetch[buf_offset:]
-        if size < len(prefetch):
-            self._prefetch_data[self._realpos + size] = prefetch[size:]
-            prefetch = prefetch[:size]
+        with self._prefetch_condition:
+            if offset is None:
+                if self._prefetch_done:
+                    self._prefetching = False
+                return None
+            start = self._realpos
+            prefetch = self._remove_prefetch_data_locked(offset)
+            prefetch = prefetch[start - offset :]
+            if size < len(prefetch):
+                self._add_prefetch_data_locked(
+                    start + size, prefetch[size:]
+                )
+                prefetch = prefetch[:size]
+            self._prefetch_ranges = self._subtract_range(
+                self._prefetch_ranges, start, start + len(prefetch)
+            )
+            self._discard_unwanted_prefetch_data_locked()
+            self._prefetch_condition.notify_all()
         return prefetch
 
     def _read(self, size):
@@ -270,6 +489,7 @@ class SFTPFile(BufferedFile):
         else:
             self._realpos = self._pos = self._get_size() + offset
         self._rbuffer = bytes()
+        self._seek_prefetch(self._realpos)
 
     def stat(self):
         """
@@ -435,7 +655,13 @@ class SFTPFile(BufferedFile):
         """
         self.pipelined = pipelined
 
-    def prefetch(self, file_size=None, max_concurrent_requests=None):
+    def prefetch(
+        self,
+        file_size=None,
+        max_concurrent_requests=None,
+        *,
+        max_prefetch_bytes=None,
+    ):
         """
         Pre-fetch the remaining contents of this file in anticipation of future
         `.read` calls.  If reading the entire file, pre-fetching can
@@ -458,6 +684,11 @@ class SFTPFile(BufferedFile):
             The maximum number of concurrent read requests to prefetch. See
             `.SFTPClient.get` (its ``max_concurrent_prefetch_requests`` param)
             for details.
+        :param int max_prefetch_bytes:
+            Maximum number of bytes allowed in unread prefetch data and
+            responses already in flight. When the limit is reached, the
+            background thread pauses until `.read`, `.seek`, or
+            `.cancel_prefetch` frees space.
 
         .. versionadded:: 1.5.1
         .. versionchanged:: 1.16.0
@@ -467,6 +698,8 @@ class SFTPFile(BufferedFile):
             compatibility.
         .. versionchanged:: 3.3
             Added ``max_concurrent_requests``.
+        .. versionchanged:: 5.0
+            Added ``max_prefetch_bytes`` and cancellation-aware seek behavior.
         """
         if file_size is None:
             file_size = self.stat().st_size
@@ -474,14 +707,27 @@ class SFTPFile(BufferedFile):
         # queue up async reads for the rest of the file
         chunks = []
         n = self._realpos
+        ranges = [(n, file_size)]
         while n < file_size:
             chunk = min(self.MAX_REQUEST_SIZE, file_size - n)
             chunks.append((n, chunk))
             n += chunk
         if len(chunks) > 0:
-            self._start_prefetch(chunks, max_concurrent_requests)
+            self._start_prefetch(
+                chunks,
+                max_concurrent_requests,
+                max_prefetch_bytes=max_prefetch_bytes,
+                ranges=ranges,
+                mode="sequential",
+            )
 
-    def readv(self, chunks, max_concurrent_prefetch_requests=None):
+    def readv(
+        self,
+        chunks,
+        max_concurrent_prefetch_requests=None,
+        *,
+        max_prefetch_bytes=None,
+    ):
         """
         Read a set of blocks from the file by (offset, length).  This is more
         efficient than doing a series of `.seek` and `.read` calls, since the
@@ -495,11 +741,16 @@ class SFTPFile(BufferedFile):
             The maximum number of concurrent read requests to prefetch. See
             `.SFTPClient.get` (its ``max_concurrent_prefetch_requests`` param)
             for details.
+        :param int max_prefetch_bytes:
+            Maximum number of bytes allowed in unread prefetch data and
+            responses already in flight.
         :return: a list of blocks read, in the same order as in ``chunks``
 
         .. versionadded:: 1.5.4
         .. versionchanged:: 3.3
             Added ``max_concurrent_prefetch_requests``.
+        .. versionchanged:: 5.0
+            Added ``max_prefetch_bytes``.
         """
         self.sftp._log(
             DEBUG, "readv({}, {!r})".format(hexlify(self.handle), chunks)
@@ -520,7 +771,17 @@ class SFTPFile(BufferedFile):
                 offset += chunk_size
                 size -= chunk_size
 
-        self._start_prefetch(read_chunks, max_concurrent_prefetch_requests)
+        ranges = self._merge_ranges(
+            [(offset, offset + size) for offset, size in chunks]
+        )
+        self._start_prefetch(
+            read_chunks,
+            max_concurrent_prefetch_requests,
+            max_prefetch_bytes=max_prefetch_bytes,
+            ranges=ranges,
+            mode="readv",
+            waiting_offset=chunks[0][0],
+        )
         # now we can just devolve to a bunch of read()s :)
         for x in chunks:
             self.seek(x[0])
@@ -534,57 +795,206 @@ class SFTPFile(BufferedFile):
         except:
             return 0
 
-    def _start_prefetch(self, chunks, max_concurrent_requests=None):
-        self._prefetching = True
-        self._prefetch_done = False
+    def _start_prefetch(
+        self,
+        chunks,
+        max_concurrent_requests=None,
+        max_prefetch_bytes=None,
+        ranges=None,
+        mode=None,
+        waiting_offset=None,
+    ):
+        if (
+            max_concurrent_requests is not None
+            and max_concurrent_requests <= 0
+        ):
+            raise ValueError("max_concurrent_requests must be positive")
+        if max_prefetch_bytes is not None and max_prefetch_bytes < 0:
+            raise ValueError("max_prefetch_bytes must be non-negative")
 
-        t = threading.Thread(
-            target=self._prefetch_thread,
-            args=(chunks, max_concurrent_requests),
-        )
-        t.daemon = True
-        t.start()
+        start_thread = False
+        thread = None
+        with self._prefetch_condition:
+            self._prefetching = True
+            self._prefetch_done = False
+            self._prefetch_closing = False
+            self._prefetch_active = True
+            self._prefetch_mode = mode
+            self._prefetch_waiting_offset = (
+                waiting_offset
+                if waiting_offset is not None
+                else self._realpos
+            )
+            self._prefetch_max_concurrent_requests = (
+                max_concurrent_requests
+            )
+            self._prefetch_byte_budget = max_prefetch_bytes
+            self._prefetch_ranges = self._merge_ranges(
+                (self._prefetch_ranges or []) + (ranges or [])
+            )
 
-    def _prefetch_thread(self, chunks, max_concurrent_requests):
+            generation = self._prefetch_generation
+            existing = {
+                (extent[0], extent[1])
+                for extent in self._prefetch_extents.values()
+            }
+            for offset, length in chunks:
+                if (offset, length) in existing:
+                    continue
+                existing.add((offset, length))
+                self._prefetch_pending.append((offset, length, generation))
+            self._discard_unwanted_prefetch_data_locked()
+
+            start_thread = (
+                self._prefetch_thread_handle is None
+                or not self._prefetch_thread_handle.is_alive()
+            )
+            if start_thread:
+                thread = threading.Thread(
+                    target=self._prefetch_thread,
+                    args=(generation,),
+                )
+                thread.daemon = True
+                self._prefetch_thread_handle = thread
+            self._prefetch_condition.notify_all()
+        if start_thread:
+            thread.start()
+
+    def _prefetch_thread(self, generation):
         # do these read requests in a temporary thread because there may be
         # a lot of them, so it may block.
-        for offset, length in chunks:
-            # Limit the number of concurrent requests in a busy-loop
-            if max_concurrent_requests is not None:
-                while True:
-                    with self._prefetch_lock:
-                        pf_len = len(self._prefetch_extents)
-                        if pf_len < max_concurrent_requests:
-                            break
-                    time.sleep(io_sleep)
+        try:
+            while True:
+                with self._prefetch_condition:
+                    while True:
+                        if (
+                            self._prefetch_closing
+                            or generation != self._prefetch_generation
+                        ):
+                            return
+                        current_generation = self._prefetch_generation
+                        while self._prefetch_pending:
+                            offset, length, chunk_generation = (
+                                self._prefetch_pending[0]
+                            )
+                            if chunk_generation != current_generation:
+                                self._prefetch_pending.popleft()
+                                continue
+                            if self._range_intersects(
+                                self._prefetch_ranges,
+                                offset,
+                                offset + length,
+                            ):
+                                break
+                            self._prefetch_pending.popleft()
+                        else:
+                            if not self._prefetch_active:
+                                if not self._prefetch_extents:
+                                    self._prefetch_done = True
+                                    self._prefetch_condition.notify_all()
+                                return
+                            self._prefetch_condition.wait(io_sleep)
+                            continue
 
-            num = self.sftp._async_request(
-                self, CMD_READ, self.handle, int64(offset), int(length)
-            )
-            with self._prefetch_lock:
-                self._prefetch_extents[num] = (offset, length)
+                        waiting = self._prefetch_waiting_offset
+                        urgent = (
+                            waiting is not None
+                            and offset <= waiting < offset + length
+                            and self._coverage_end_locked(
+                                waiting, exclude_pending=True
+                            )
+                            <= waiting
+                        )
+                        current_extents = [
+                            extent
+                            for extent in self._prefetch_extents.values()
+                            if extent[2] == current_generation
+                        ]
+                        in_flight_bytes = sum(
+                            extent[1] for extent in current_extents
+                        )
+                        limit = self._prefetch_max_concurrent_requests
+                        limit_ok = (
+                            limit is None
+                            or len(current_extents) < limit
+                        )
+                        budget = self._prefetch_byte_budget
+                        budget_ok = (
+                            budget is None
+                            or self._prefetch_cached_bytes + in_flight_bytes
+                            < budget
+                        )
+                        if limit_ok and (budget_ok or urgent):
+                            self._prefetch_pending.popleft()
+                            break
+                        self._prefetch_condition.wait(io_sleep)
+                        continue
+
+                request_number = self.sftp._request_number()
+                with self._prefetch_condition:
+                    if (
+                        self._prefetch_closing
+                        or generation != self._prefetch_generation
+                    ):
+                        return
+                    self._prefetch_extents[request_number] = (
+                        offset,
+                        length,
+                        generation,
+                    )
+                    self._prefetch_condition.notify_all()
+                try:
+                    self.sftp._async_request_with_number(
+                        request_number,
+                        self,
+                        CMD_READ,
+                        self.handle,
+                        int64(offset),
+                        int(length),
+                    )
+                except Exception:
+                    with self._prefetch_condition:
+                        self._prefetch_extents.pop(request_number, None)
+                        self._prefetch_condition.notify_all()
+                    raise
+        except Exception as e:
+            with self._prefetch_condition:
+                self._saved_exception = e
+                self._prefetch_done = True
+                self._prefetch_condition.notify_all()
 
     def _async_response(self, t, msg, num):
+        with self._prefetch_condition:
+            extent = self._prefetch_extents.pop(num, None)
+        if extent is None:
+            return
+        offset, length, generation = extent
         if t == CMD_STATUS:
-            # save exception and re-raise it on next file operation
             try:
                 self.sftp._convert_status(msg)
             except Exception as e:
-                self._saved_exception = e
+                with self._prefetch_condition:
+                    self._saved_exception = e
+                    self._finish_prefetch_response_locked()
+            else:
+                with self._prefetch_condition:
+                    self._finish_prefetch_response_locked()
             return
         if t != CMD_DATA:
             raise SFTPError("Expected data")
         data = msg.get_string()
-        while True:
-            with self._prefetch_lock:
-                # spin if in race with _prefetch_thread
-                if num in self._prefetch_extents:
-                    offset, length = self._prefetch_extents[num]
-                    self._prefetch_data[offset] = data
-                    del self._prefetch_extents[num]
-                    if len(self._prefetch_extents) == 0:
-                        self._prefetch_done = True
-                    break
+        with self._prefetch_condition:
+            end = offset + min(len(data), length)
+            if self._range_intersects(
+                self._prefetch_ranges or [], offset, end
+            ) and data:
+                self._add_prefetch_data_locked(offset, data[:length])
+            self._finish_prefetch_response_locked()
+
+    def _finish_prefetch_response_locked(self):
+        if not self._prefetch_extents and not self._prefetch_pending:
+            self._prefetch_done = True
+        self._prefetch_condition.notify_all()
 
     def _check_exception(self):
         """if there's a saved exception, raise & clear it"""

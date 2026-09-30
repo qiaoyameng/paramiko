@@ -765,6 +765,7 @@ class SFTPClient(BaseSFTP, ClosingContextManager):
         callback=None,
         prefetch=True,
         max_concurrent_prefetch_requests=None,
+        max_prefetch_bytes=None,
     ):
         """
         Copy a remote file (``remotepath``) from the SFTP server and write to
@@ -784,6 +785,9 @@ class SFTPClient(BaseSFTP, ClosingContextManager):
             The maximum number of concurrent read requests to prefetch. See
             `.SFTPClient.get` (its ``max_concurrent_prefetch_requests`` param)
             for details.
+        :param int max_prefetch_bytes:
+            Maximum number of bytes allowed in unread prefetch data and
+            responses already in flight.
         :return: the `number <int>` of bytes written to the opened file object
 
         .. versionadded:: 1.10
@@ -791,11 +795,17 @@ class SFTPClient(BaseSFTP, ClosingContextManager):
             Added the ``prefetch`` keyword argument.
         .. versionchanged:: 3.3
             Added ``max_concurrent_prefetch_requests``.
+        .. versionchanged:: 5.0
+            Added ``max_prefetch_bytes``.
         """
         file_size = self.stat(remotepath).st_size
         with self.open(remotepath, "rb") as fr:
             if prefetch:
-                fr.prefetch(file_size, max_concurrent_prefetch_requests)
+                fr.prefetch(
+                    file_size,
+                    max_concurrent_prefetch_requests,
+                    max_prefetch_bytes=max_prefetch_bytes,
+                )
             return self._transfer_with_callback(
                 reader=fr, writer=fl, file_size=file_size, callback=callback
             )
@@ -807,6 +817,7 @@ class SFTPClient(BaseSFTP, ClosingContextManager):
         callback=None,
         prefetch=True,
         max_concurrent_prefetch_requests=None,
+        max_prefetch_bytes=None,
     ):
         """
         Copy a remote file (``remotepath``) from the SFTP server to the local
@@ -827,6 +838,9 @@ class SFTPClient(BaseSFTP, ClosingContextManager):
             imposes a limit of 64 concurrent requests, while Paramiko imposes
             no limit by default; consider setting a limit if a file can be
             successfully received with sftp but hangs with Paramiko.
+        :param int max_prefetch_bytes:
+            Maximum number of bytes allowed in unread prefetch data and
+            responses already in flight.
 
         .. versionadded:: 1.4
         .. versionchanged:: 1.7.4
@@ -835,6 +849,8 @@ class SFTPClient(BaseSFTP, ClosingContextManager):
             Added the ``prefetch`` keyword argument.
         .. versionchanged:: 3.3
             Added ``max_concurrent_prefetch_requests``.
+        .. versionchanged:: 5.0
+            Added ``max_prefetch_bytes``.
         """
         with open(localpath, "wb") as fl:
             size = self.getfo(
@@ -843,6 +859,7 @@ class SFTPClient(BaseSFTP, ClosingContextManager):
                 callback,
                 prefetch,
                 max_concurrent_prefetch_requests,
+                max_prefetch_bytes,
             )
         s = os.stat(localpath)
         if s.st_size != size:
@@ -856,29 +873,34 @@ class SFTPClient(BaseSFTP, ClosingContextManager):
         num = self._async_request(type(None), t, *args)
         return self._read_response(num)
 
+    def _request_number(self):
+        with self._lock:
+            num = self.request_number
+            self.request_number += 1
+        return num
+
+    def _async_request_with_number(self, num, fileobj, t, *args):
+        msg = Message()
+        msg.add_int(num)
+        for item in args:
+            if isinstance(item, int64):
+                msg.add_int64(item)
+            elif isinstance(item, int):
+                msg.add_int(item)
+            elif isinstance(item, SFTPAttributes):
+                item._pack(msg)
+            else:
+                # For all other types of items, rely on as_string() to either
+                # coerce to bytes before writing or raise a suitable exception.
+                msg.add_string(item)
+        with self._lock:
+            self._expecting[num] = fileobj
+        self._send_packet(t, msg)
+
     def _async_request(self, fileobj, t, *args):
         # this method may be called from other threads (prefetch)
-        self._lock.acquire()
-        try:
-            msg = Message()
-            msg.add_int(self.request_number)
-            for item in args:
-                if isinstance(item, int64):
-                    msg.add_int64(item)
-                elif isinstance(item, int):
-                    msg.add_int(item)
-                elif isinstance(item, SFTPAttributes):
-                    item._pack(msg)
-                else:
-                    # For all other types, rely on as_string() to either coerce
-                    # to bytes before writing or raise a suitable exception.
-                    msg.add_string(item)
-            num = self.request_number
-            self._expecting[num] = fileobj
-            self.request_number += 1
-        finally:
-            self._lock.release()
-        self._send_packet(t, msg)
+        num = self._request_number()
+        self._async_request_with_number(num, fileobj, t, *args)
         return num
 
     def _read_response(self, waitfor=None):

@@ -2,6 +2,12 @@
 Changelog
 =========
 
+- :feature:`-` Added ``max_prefetch_bytes`` to SFTP file prefetching and
+  `SFTPClient.get`/`getfo`, allowing callers to bound the memory used by
+  in-flight and cached prefetch responses. Seeking now cancels unneeded
+  pending prefetch work, `SFTPFile.cancel_prefetch` cancels active prefetch
+  while safely consuming late responses, and closing a file now joins the
+  prefetch worker and surfaces pending prefetch errors.
 - :feature:`-` Added support for the ``mlkem768x25519-sha256`` post-quantum
   hybrid key exchange method described in
   ``draft-ietf-sshm-mlkem-hybrid-kex``. It pairs ML-KEM-768 (FIPS 203) with
