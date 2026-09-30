@@ -765,6 +765,7 @@ class SFTPClient(BaseSFTP, ClosingContextManager):
         callback=None,
         prefetch=True,
         max_concurrent_prefetch_requests=None,
+        max_concurrent_prefetch_bytes=None,
     ):
         """
         Copy a remote file (``remotepath``) from the SFTP server and write to
@@ -784,6 +785,10 @@ class SFTPClient(BaseSFTP, ClosingContextManager):
             The maximum number of concurrent read requests to prefetch. See
             `.SFTPClient.get` (its ``max_concurrent_prefetch_requests`` param)
             for details.
+        :param int max_concurrent_prefetch_bytes:
+            The maximum number of bytes of prefetched data to buffer. See
+            `.SFTPFile.prefetch` (its ``max_concurrent_bytes`` param) for
+            details.
         :return: the `number <int>` of bytes written to the opened file object
 
         .. versionadded:: 1.10
@@ -791,11 +796,17 @@ class SFTPClient(BaseSFTP, ClosingContextManager):
             Added the ``prefetch`` keyword argument.
         .. versionchanged:: 3.3
             Added ``max_concurrent_prefetch_requests``.
+        .. versionchanged:: 5.0
+            Added ``max_concurrent_prefetch_bytes``.
         """
         file_size = self.stat(remotepath).st_size
         with self.open(remotepath, "rb") as fr:
             if prefetch:
-                fr.prefetch(file_size, max_concurrent_prefetch_requests)
+                fr.prefetch(
+                    file_size,
+                    max_concurrent_prefetch_requests,
+                    max_concurrent_prefetch_bytes,
+                )
             return self._transfer_with_callback(
                 reader=fr, writer=fl, file_size=file_size, callback=callback
             )
@@ -807,6 +818,7 @@ class SFTPClient(BaseSFTP, ClosingContextManager):
         callback=None,
         prefetch=True,
         max_concurrent_prefetch_requests=None,
+        max_concurrent_prefetch_bytes=None,
     ):
         """
         Copy a remote file (``remotepath``) from the SFTP server to the local
@@ -827,6 +839,10 @@ class SFTPClient(BaseSFTP, ClosingContextManager):
             imposes a limit of 64 concurrent requests, while Paramiko imposes
             no limit by default; consider setting a limit if a file can be
             successfully received with sftp but hangs with Paramiko.
+        :param int max_concurrent_prefetch_bytes:
+            The maximum number of bytes of prefetched data to buffer. See
+            `.SFTPFile.prefetch` (its ``max_concurrent_bytes`` param) for
+            details.
 
         .. versionadded:: 1.4
         .. versionchanged:: 1.7.4
@@ -835,6 +851,8 @@ class SFTPClient(BaseSFTP, ClosingContextManager):
             Added the ``prefetch`` keyword argument.
         .. versionchanged:: 3.3
             Added ``max_concurrent_prefetch_requests``.
+        .. versionchanged:: 5.0
+            Added ``max_concurrent_prefetch_bytes``.
         """
         with open(localpath, "wb") as fl:
             size = self.getfo(
@@ -843,6 +861,7 @@ class SFTPClient(BaseSFTP, ClosingContextManager):
                 callback,
                 prefetch,
                 max_concurrent_prefetch_requests,
+                max_concurrent_prefetch_bytes,
             )
         s = os.stat(localpath)
         if s.st_size != size:
